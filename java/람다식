@@ -1,0 +1,21 @@
+람다식 -> 매개 변수를 가진 코드 블록 -> 익명 구현 객체
+
++익명구현 객체 생성
+Runnable runnable = new Runnable() {
+	public void run() {...}
+};
+
++익명 구현 객체를 람다식으로 표현
+Runnable runnable = () -> {...};
+
++람다식 원형
+(int a) -> { System.out.println(a); }
+
++타입 생략
+(a) -> { System.out.println(a); }
+
++매개변수가 하나만 있을 때
+a -> System.out.println(a)
+
++매개변수가 없을 때
+() -> { 실행문;}

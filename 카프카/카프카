@@ -1,0 +1,458 @@
++스프링 부트에서 카프카서서 메시지 주고 받아보기
+카프카가 무엇인지와 스프링에서 카프카를 사용하는 방법에 대해서 알아보도록 한다.
+
+왜 메시지 큐를 쓰는가?
+메시지 큐를 쓰는 이유는 대략적으로 아래와 같다.
+먼저, 기존의 단순한 동기식 통신 방식에 비해서 더 뛰어난 응답속도를 보여준다.
+기존의 동기식 통신방식은 사용자로부터 요청을 받아서 요청을 다 처리할 때까지 블로킹 상태에 빠진다.
+즉, 요청이 전부 처리 되어야 사용자에게 응답을 주게 된다.
+
+하지만 메시지 큐를 이용하는 경우 사용자에게 요청을 받으면 큐에다 집어 넣기만 하면 바로 다음 사용자의 요청을 받아들일 수 있기
+때문에 응답속도가 향상되게 된다.
+(실제 처리는 쌓여진 큐에 다른 워커 프로세스가 1개씩 가져가서 처리하는 방식으로 이루어진다.)
+
+실제로 Node.js와 같은 비동기 방식 아키텍처를 적용한 시스템과 같은 경우 내부적으로 이벤트 큐를 이용하여 비동기를 구현한다.
+또한, 메시지 큐를 이용해서 메시지를 주고 받을 수 있다는 사실이 객체지향에서의 메서드 호출 즉, 다른 객체에게 해당 동작을
+수행하라고 부탁하는 메시지를 보내는 거라는 의미로 생각할 수 있다.
+
+요약하면 메시지 큐를 이용해서 서로 다른 이기종/네트워크에 있는 서비스를 마치 함수호출하듯이 사용할 수 있다.
+(보통 이러한 방식을 PRC 또는 PRI 방식이라고 한다.)
+
+이러한 방식을 사용하면 각 기능간의 결합도를 낮출 수 있다.(모듈 간 결합도가 줄어든다.)
+(심지어 각 기능을 서로 다른 언어로 짜도 되고, 각 모듈을 서로 다른 서버에 배치할 수도 있다.)
+
+이렇게 서비스의 결합을 분리해버리면 모놀리틱 서비스(한 프로그램에 모든 기능이 전부 몰려있는 방식)이 서비스가 죽으면 
+모든 기능을 전부 쓰지 못하는데 반해, 위 방식처럼 서비스를 분리하면 한 서비스가 죽어도 죽어버린 서비스 이 외의 나머지
+서비스는 동작을 하기 때문에 서비스의 안정성이 올라가게 된다.
+(사실, 메시지 큐를 관리해야하는 이슈들 때문에 꼭 그렇지는 않다.)
+
+이렇게 메시지 큐를 잘 사용하면 대규모 데이터를 처리하거나 응답속도가 중요한 서비스에서 많은 이점을 누릴 수 있다.
+
+메시지 큐 서비스의 종류는 상당히 다양하다.
+rabbitMQ, ZeroMQ, ActiveMQ등이 잇다.
+
+그 중에서 우리가 다룰 메시지 큐는 카프카이다.
+
++카프카의 이점?
+카프카가 다른 서비스 대비 이점이 무엇이 있을까?
+
+카프카의 장점은 아래와 같다.
+ 1. 다른 메시지 큐에 비해 실시간 로그 처리에 특화 되어있음.
+ 2. 파일 시스템에 메시지를 저장함
+    - 데이터의 영속성이 보장됨
+    - Sequential하게 읽고 쓰는 경우 기존 메시지 큐와 속도차이가 비슷하거나 더 빠른 경우도 있음
+    - 다른 메시지 큐에 비해 메시지 유실 위험이 적고, 에러 복구가 용이함
+ 3. 프로토롤이 다른 MQ에 비해서 간단하기 때문에 오버헤드가 적음
+ 
+ 실제로 카프카는 다른 MQ에 비해서 성능이 5배정도 빠르다.
+ 
++카프카 사용하기
+ 1. 의존성 추가
+ 2. 프로퍼티 설정(application.yml or application.properties)
+  kafka.bootstrapAddress=localhost:9092
+  message.topic.name=mytopic
+  greeting.topic.name=greeting
+  filtered.topic.name=filtered
+  partitioned.topic.name=partitioned
+ 
+ 3. 토픽 생성(토픽 -> https://needjarvis.tistory.com/603)
+ 
+ import org.apache.kafka.clients.admin.AdminClientConfig;
+ import org.apache.kafka.clients.admin.NewTopic;
+ import org.apache.kafka.common.internals.Topic;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.kafka.core.KafkaAdmin;
+ 
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+ @Configuration
+ public class KafkaConfig {
+    @Value(value = "${kafka.bootstrapAddress}")
+    private String bootstrapAddress;
+    
+    @Value(value = "${message.topic.name]")
+    private String topicName;
+    
+    @Value(value = "${partitioned.topic.name}")
+    private String partionedTopicName;
+    
+    @Value(value = "${filtered.topic.name}")
+    privaet String filterdTopicName;
+    
+    @Value(value = "${greeting.topic.name}")
+    private String greetingTopicName;
+    
+    @Bean
+    public KafkaAdmin kafkaAdmin() {
+       Map<String, Object> configs = new HashMap<>();
+       configs.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+       return new KafkaAdmin(configs);
+    }
+    
+    @Bean
+    public NewTopic topic1() {
+       return new NewTopic(topicName, 1, (short)1);
+    }
+    
+    @Bean
+    public NewTopic topic2() {
+       return new NewTopic(partionedTopicName, 6, (short)1);
+    }
+    
+    @Bean
+    public NewTopic topic3() {
+       return new NewTopic(filteredTopicName, 1, (short) 1);
+    }
+    
+    @Bean
+    public NewTopic topic4() {
+       return new NewTopic(greetingTopicName, 1, (short) 1);
+    }
+ }
+ 
+ Kafka-Spring에서는 위와 같이 코드를 이용해서 코드 상에서 메시지 큐의 토픽을 생성할 수 있다.
+ 스프링 부트에서는 위와 같이 토픽을 생성해주는 함수를 만들고 Bean으로 등록해주면 자동으로 토픽을 생성해서 주입해준다.
+ 또한, KafkaAdmin 타입의 생성자를 만들어서, 카프카의 설정정보도 주입이 가능하다.
+ 
+ 실제로 메시지를 발행하는 Producer에 관한 설정코드를 작성해보자.
+ 
+ import com.example.kafkaexample.Greeting;
+ import org.apache.kafka.clients.producer.Producerconfig;
+ import org.apache.kafka.common.serialization.StringSerializer;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+ import org.springframework.kafka.core.KafkaTemplate;
+ import org.springframework.kafka.core.ProducerFactory;
+ import org.springframework.kafka.support.serializer.JsonSerializer;
+ 
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+ @Configuration
+ public class KafkaProducerConfig {
+    
+    @Value(value = "${kafka.bootstrapAddress}")
+    private String bootstrapAddress;
+    
+    @Bean
+    public ProducerFactory<String, String> producerFactory() {
+      Map<String, Object> configProps = new HashMap<>();
+      configProps.put(
+         ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
+         bootstrapAdderess
+      );
+      configProps.put(
+         ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+         StringSerializer.class
+      );
+      configProps.put(
+         ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+         StringSerializer.class
+      );
+      
+      return new DefaultKafkaProducerFactory<>(configProps);
+  }
+  
+  @Bean
+  public KafkaTemplate<String, String> kafkaTemplate() {
+     return new KafkaTemplate<String, String>(producerFactory());
+  }
+  
+  public ProducerFactory<String, Greeting> greetingProducerFactory() {
+     Map<String, Object> configProps = new HashMap<>();
+     configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+     configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+     configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+     return new DefaultKafkaProducerFactory<>(configProps);
+  }
+  
+  @Bean
+  public KafkaTemplate<String, Greeting> greetingKafkaTemplate() {
+     return new KafkaTemplate<>(greetingProducerFactory());
+  }
+ }
+   
+ 먼저, ProducerFactory(일종의 편지봉투) 객체를 이용해서 각 메시지 종류별로 메시지를 어디에 보내고 
+ 어떠한 방식으로 처리할 것인지를 설정해준다.
+ 
+ 카프카에서 실제 메세지는 KafkaTemplate이라는 객체에 담겨서 보내지게 된다.
+ 
+ 만약 소켓프로그래밍에 익숙하다면 Producer 객체는 소켓 디스크립터고 ProducerFactory는 소켓 디스크립터를 만들어주는
+ 팩토리 메서드라고 이해하면 된다.
+ 
+ 위의 코드에서는 2가지 종류의 메세지를 정의했다.
+ (즉 2가지 종류의 편지봉투를 만들었다. producerFactory, greetingProducerFactory)
+ 
+ 실제로 메세지를 가져오는 부분인 Consumer에 대한 코드를 작성해보자.
+ 
+ import com.example.kafkaexample.Greeting;
+ import org.springframework.kafka.support.serializer.JsonDeserializer;
+ import org.apache.kafka.clients.consumer.ConsumerConfig;
+ import org.apache.kafka.common.serialization.StringDeserializer;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.srpingframework.kafka.annotation.Enablekafka;
+ import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+ import org.springframework.kafka.core.ConsumerFactory;
+ import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+ 
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+ @EnableKafka
+ @Configuration
+ public class KafkaConsumerConfig {
+    
+    @Value(value = "${kafka.bootstrapAddress}")
+    private String bootstrapAddress;
+    
+    public ConsumerFactory<String, String> consumerFactory(String groupId) {
+       Map<String, Object> props = new HashMap<>();
+       props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+       props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+       props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+       props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+       return new DefaultKafkaConsumerFactory<>(props);
+    }
+    
+    public ConcurrentKafkaListenerContainFactory<String, String> KafkaListenerContainerFactory(String groupId) {
+       ConcurrentKafkaListenerContainFactory<String, String> factory = new ConcurrentKafkaListenerContainerFactory<>();
+       factory.setConsumerFactory(consumerFactory(groupId));
+       return factory;
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> fooKafkaListenerContainerFactory() {
+       return KafkaListenerContainerFactory("foo");
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> barKafkaListenerContainerFactory() {
+       return KafkaListenerContainerFactory("bar");
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> headerKafkaListenerContainerFactory() {
+       return KafkaListenerContainerFactory("headers");
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> partitionKafkaListenerContainerFactory() {
+       return KafkaListenerContainerFactory("partitions");
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> filterKafkaListenerContainerFactory() {
+       ConcurrentKafkaListenerContainerFactory<String, String> factory = KafkaListenerContainerFactory("filter");
+       factory.setRecordFilterStrategy(recode -> recode.value().contains("world"));
+       return factory;
+    }
+    
+    public ConsumerFactory<String, Greeting> greetingConsumerFactory() {
+       Map<String, Object> props = new HashMap<>();
+       props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+       props.put(ConsumerConfig.GROUP_ID_CONFIG, "greeting");
+       return new DefaultKafkaConsumerFactory<>(props, new StringDesirializer(), new JsonDesirializer<>(Greeting.class));
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Greeting> greetingKafkaListenerContainerFactory() {
+       ConcurrentKafkaListenerContainerFactory<String, Greeting> factory = new ConcurrentKafkaListenerContainerFactory<String, Greeting>();
+       factory.setConsumerFactory(greetingConsumerFactory());
+       return factory;
+    }
+ }
+ 
+ 위의 Producer 부분과 유사하게 ConsumerFactory 객체를 이용해서 각 메시지 종류별로 메시지를 어디에서 받고 어떠한 방식으로 처리할 것인지를
+ 설정한다.
+ 
+ 위의 코드에서는 Consumer를 application.properties에 설정한 토픽별로 메시지를 어디서 어떻게 받을지를 설정해주는 메서드들을 지정했다.
+ 
+ 마지막으로 위에서 작성한 설정을 기반으로 아래와 같이 메시지 큐에 데이터를 넣고 빼보도록 한다.
+ 
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.boot.SpringApplication;
+ import org.springframework.boot.autoconfigure.SpringBootApplication;
+ import org.springframework.context.ConfigurableApplicationContext;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.kafka.annotation.KafkaListener;
+ import org.springframework.kafka.annotation.TopicPartition;
+ import org.springframework.kafka.core.KafkaTemplate;
+ import org.springframework.kafka.support.KafkaHeaders;
+ import org.springframework.kafka.support.SendResult;
+ import org.springframework.messaging.handler.annotation.Header;
+ import org.springframework.messaging.handler.annotation.Payload;
+ import org.springframework.util.concurrent.ListenableFutrue;
+ import org.springframework.util.concurrent.ListenableFutureCallback;
+ 
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
+ 
+ @SpringBootApplication
+ //수신/송신 부분을 실제로 사용하는 곳
+ public class KafkaExampleApplication {
+   public static void main(String[] args) throws Exception {
+      //수신, 송신 설정정보를 가져온다.
+      ConfigurableApplicationContext context = SpringApplication.run(KafkaExampleApplication.class, args);
+      
+      //설정정보에서 빈 객체를 가져온다.
+      MessageProducer producer = context.getBean(MessageProducer.class);
+      MessageListener listener = context.getBean(MessageListener.class);
+      
+      //메시지를 보낸다.
+      producer.sendMessage("Hello, World!");
+      listener.latch.await(10, TimeUnit.SECONDS);
+      
+      for (int i = 0; i < 5; i++) {
+        producer.sendMessageToPartion("Hello To Partioned Topic!", i);
+      }
+      listener.partitionLatch.await(10, TimeUnit.SECONDS);
+      
+      producer.sendMessageToFiltered("Hello Baeldung!");
+      producer.sendMessageToFiltered("Hello World!");
+      listener.filterLatch.await(10, TimeUnit.SECONDS);
+      
+      producer.sendGreetingMessage(new Greeting("Greetings", "World!");
+      listener.greeingLatch.await(10, TimeUnit.SECONDS);
+      
+      context.close();
+   }
+   
+   @Bean
+   public MessageProducer MessageProducer() {
+      return new MessageProducer();
+   }
+   
+   @Bean
+   public MessageListener messageListener() {
+      return new MessageListener();
+   }
+   
+   //메세지를 생성하는 부분 Producer
+   public static class MessageProducer {
+      
+      @Autowired
+      private KafkaTemplate<String, String> kafkaTemplate; -> Producer 코드에서 설정한 빈 객체가 주입됨
+      
+      @Autowired
+      private KafkaTemplate<String, Greeting> greetingKafkaTemplate; -> Producer 코드에서 설정한 빈 객체가 주입됨
+      
+      @Value(value = "${message.topic.name}")
+      private String topicName;
+      
+      @Value(value = "${partitioned.topic.name}")
+      private String partionedName;
+      
+      @Value(value = "${filtered.topic.name}")
+      private String filteredTopicName;
+      
+      @Value(value = "${greeting.topic.name}")
+      private String greetingTopicName;
+      
+      public void sendMessage(String message) {
+         
+         //KafkaTemplate을 이용해서 메시지를 전송
+         ListenableFuture<SendResult<String, String>> future = kafkaTemplate.send(topicName, message);
+         
+         //사실 메시지 큐 방식으로 통신하는 경우 비동기 방식으로 통신하기 때문에 (메시지가 언제올 지 알 수가 없으므로)
+         //콜백 함수를 등록한다.
+         future.addCallback(new ListenableFutureCallback<SendResult<String, String>>() {
+         
+            @Override
+            public void onSuccess(SendResult<String, String> result) {
+               System.out.println("Send message = [" + message + "] with offset = [" + result.getRecordMetadata().offset() + "]");
+            }
+            
+            @Override
+            public void onFailure(Throwable ex) {
+               System.out.println("Unable to send message = [" + message + "] due to : " + ex.getMessage());
+            }
+          });
+      }
+      
+      public void sendMessageToPartion(String message, int partition) {
+         KafkaTemplate.send(partionedTopicName, partition, null, message);
+      }
+      
+      public void sendMessageToFiltered(String message) {
+         KafkaTemplate.send(filteredTopicName, message);
+      }
+      
+      public void sendGreetingMessage(Greeting greeting) {
+         greetingKafkaTemplate.send(greetingTopicName, greeting);
+      }
+   }
+   
+   //메세지 수신 부분 Consumer
+   public static class MessageListener {
+   
+      private CountDownLatch latch = new CountDownLatch(3);
+      
+      private CountDownLatch partitionLatch = new CountDownLatch(2);
+      
+      private CoundDownLatch filterLatch = new CountDownLatch(2);
+      
+      private CountDownLatch greetingLatch = new CountDownLatch(1);
+      
+      //어떤 토픽의 메세지를 어떠한 방식으로 받을 지를 @KafkaListener로 설정.
+      //특정 파티션의 메세지를 받거나 특정 그룹의 메세지를 받거나 하는 등의 설정도 가능하다.
+      @KafkaListener(topics = "${message.topic.name}", groupId = "foo", containerFactory = "fooKafkaListenerContainerFactory")
+      public void listenGroupBar(String message) {
+          System.out.println("Received Message in group 'bar' : " + message);
+          
+          //Consumer와 같은 경우, 병렬로 메시지를 처리하는 경우도 있기 때문에, 동시접근으로 인한 Race Condition(세마포어)과 같은 경우를
+          //막기 위해 CountDownLatch라는 함수를 이용해서 접근을 제한하게 된다.
+          latch.countDown();
+      }
+      
+      @KafkaListener(topics = "${message.topic.name}", groupId = "bar", containerFactory = "barKafkaListenerContainerFactory")
+      public void listenerGroupBar(String message) {
+         System.out.println("Received Message in group 'bar' : " + message);
+         latch.countDown();
+      }
+      
+      @KafkaListener(topics = "${message.topic.name}", containerFactory = "headersKafkaListenerContainerFactory")
+      public void listenWithHeaders(@Payload String message, @Header(KafkaHeaders.RECEIVED_PARTITION_ID) int partition) {
+         System.out.println("Received Message : " + message + " from partition: " + partition);
+         latch.countDown();
+      }
+      
+      @KafkaListener(topicParitions = @TopicPartition(topic = "${partitioned.topic.name}", partitions = { "0", "3" }), 
+      containerFactory = "partitionsKafkaListenerContainerFactory")
+      public void listenToPartition(@Payload String message, @Header(KafkaHeaders.RECEIVED_PARTITION_ID) int partition) {
+         System.out.println("Received Message: " + message + "from partition: " + partition);
+         this.partitionLatch.countDown();
+      }
+      
+      @KafkaListener(topics = "${filtered.topic.name}", containerFactory = "filterKafkaListenerContainerFactory")
+      public void listenWithFilter(String message) {
+         System.out.println("Recived Message in filtered listener : " + message);
+         this.filterLatch.countDown();
+      }
+      
+      @KafkaListener(topics = "${greeting.topic.name}", containerFactory = "greetingKafkaListenerContainerFactory")
+      public void greetingListener(Greeting greeting) {
+         System.out.println("Received greeting message: " + greeting);
+         this.greetingLatch.countDown();
+      }
+    }
+  }
+  
+  실행해보면 아래와 같이 메시지를 주고받는 것을 알 수 있다.
+  Send message=[Hello, World!] with offset=[1]
+  Received Message in group 'bar': Hello, World!
+  Received Message in group 'foo': Hello, World!
+  Received Message: Hello, World! from parition: 0
+  Received Message: Hello To Partioned Topic! from partition : 0
+  Received Message: Hello To Partioned Topic! from partition : 3
+  Received Message in filtered listener: Hello Baeldung!
+  Received Message in filtered listener: Hello World!
+  
+    

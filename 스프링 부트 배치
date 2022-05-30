@@ -1,0 +1,807 @@
++스프링 부트 배치
+스프링 배치는 백엔드의 배치 처리 기능을 구현하는 데 사용하는 프레임워크이다.
+스프링 부트 배치는 스프링 배치의 설정 요소들을 간편화시켜 스프링 배치를 빠르게 설정하는 데 도움을 준다.
+
+휴면회원 전환 기능은 일괄로 처리하는 것이 적절하므로 스프링 부트 배치로 처리한다.
+
++스프링 부트 배치 주의사항
+스프링 부트 배치는 스프링 배치를 간편하게 사용할 수 있게 래핑한 프로젝트이다.
+1. 스프링 부트 배치는 스케줄러를 제공하지 않는다. 배치처리 기능만 제공하며 스케줄링 기능은  스프링에서 제공하는 쿼츠 프레임워크를 이용해야 한다.
+
++스프링 부트 배치
+스프링 부트 배치가 2.0(스프링 배치 4.0.0.RELEASE)으로 업그레이드되었지만 여전히 일반적인 배치 절차를 따른다.
+배치의 일반적인 시나리오는 다음과 같다.
+1. 읽기(read) : 데이터 저장소(일반적으로 데이터베이스)에서 특정 데이터 레코드를 읽는다.
+2. 처리(processing) : 원하는 방식으로 데이터를 가공/처리한다.
+3. 쓰기(write) : 수정된 데이터를 다시 저장소(데이터베이스)에 저장한다.
+즉, 배치처리는 읽기 -> 처리 -> 쓰기 흐름을 갖는다.
+
+JobLauncher - Job - Step(ItmReader, ItemProcessor, ItemWriter)
+      ↕        ↕       ↕ 
+       JobRepository
+
+Job과 Step은 1:M, Step과 ItemReader, ItemProcessor, ItemWritersms 1:1의 관계를 가진다.
+즉, Job이라는 하나의 큰 일감에 여러 단계(Step)를 두고, 각 단계를 배치의 기본 흐름대로 구현한다.
+
++Job
+Job은 배치 처리 과정을 하나의 단위로 만들어 표현한 객체이다.
+스프링 배치에서 Job 객체는 여러 Step 인스턴스를 포함하는 컨테이너(여러 객체를 모아둔 곳)이다.
+
+Job 객체를 만드는 빌더는 여러개 있다. 여러 빌더를 통합 처리하는 공장인 JobBuilderFactory로 원하는 Job을 손쉽게 만들 수 있다. 
+JobBuilderFactory()의 get() 메서드로 JobBuilder를 생성하고 이를 이용하여 Job을 생성한다.
+
+public class JobBuilderFactory {
+  private JobRepository jobRepository;
+  
+  public JobBuilderFactory(JobRepository jobRepository) {
+    this.jobRepository = jobRepository;
+  }
+  
+  public JobBuilder get(String name) {
+    JobBuilder builder = new JobBuilder(name).repository(jobRepository);
+    return builder;
+  }
+}
+
+JobBuilderFactory는 JobBuilder를 생성할 수 있는 get() 메서드를 포함하고 있다.
+get() 메서드 내부를 보면 JobBuilderFactory가 새로운 JobBuilder를 생성해서 반환하는 것을 확인할 수 있다.
+JobBuilderFactory에 get() 메서드를 호출할 때마다 새로운 빌더가 생성된다.
+그리고 새로운 JobBuilder를 생성할 때마다 JobBuilderFactory가 생성될 때 주입받은 JobRepository를 JobBuilder에서 사용할
+레포지토리로 설정한다.
+
+JobBuilderFactory는 앞서 설명한 바와 같이 JobBuilder를 생성하는 역할만 수행한다.
+이렇게 생성된 JobBuilder를 이용해서 Job을 생성해야 하는데, 그렇다면 JobBuilder의 역할은
+무엇인지 JobBuilder의 메서드를 통해 기능을 알아보자.
+
+spring-batch-core-4.0.1.RELEASE.jar/org/springframework/batch/core/job/builder/JobBuilder.java
+...
+public SimpleJobBuilder start(Step step) { -> Step을 추가해서 가장 기본이 되는 SimpleJobBuilder를 생성한다.
+  return new SimpleJobBuilder(this).start(step);
+}
+
+public JobFlowBuilder start(Flow flow) {  -> Flow를 실행할 JobFlowBuilder를 생성한다.
+  return new FlowJobBuilder(this).start(flow);
+}
+
+public JobFlowBuilder flow(Step step) {  -> Step을 실행할 JobFlowBuilder를 생성한다.
+  return new FlowJobBuilder(this).start(step);
+}
+
+JobBuilder의 메서드를 살펴보니 모두 반환 타입이 빌더이다. 
+JobBuilder는 직접적으로 Job을 생성하는 것이 아니라 별도의 구체적인 빌더를 생성하여 반환한다.
+왜 이렇게 별도의 빌더를 생성하게끔 구현되어 있을까?
+경우에 따라 Job 생성 방법이 모두 다르기 때문에 별도의 구체적인 빌더를 구현하고 이를 통해 Job 생성이
+이루어지게 하려는 의도로 파악된다.
+중간에 빌더를 한번 더 반환받아 사용해야 하므로 불편할 수 있다는 생각이 들지도 모르겠지만
+메서드 체인방식을 활용하면 구체적인 빌더의 존재를 생각하지 않아도 될 만큼 손쉽게 처리할 수 있다.
+
+메서드를 좀 더 자세히 살펴보면 Job을 생성하기 위한 Step 또는 Flow를 파라미터로 받아 구체적인 빌더를 생성한다.
+Job은 Step 또는 Flow 인스턴스의 컨테이너 역할을 하기 때문에 생성하기 전에 인스턴스를 전달받는다.
+
+그럼 JobBuilder로 가장 간단하게 만들 수 있는 빌더인 SimpleJobBuilder를 이용해 Job을 생성해보자.
+
+@Autowired
+private JobBuilderFactory jobBuilderFactory;
+
+@Bean
+public Job simpleJob() {
+  return jobBuilderFactory.get("simpleJob")
+       .start(simpleStep())
+       .build();
+}
+
+JobBuilderFactory의 get() 메서드에 "simpleJob" 문자열을 파라미터로 넘기면 
+"simpleJob"이라는 이름을 가진 Job을 생성할 수 있는 JobBuilder 객체 인스턴스가 반환된다.
+여기서 simpleStep() 메서드는 아주 간단한 Step 인스턴스를 생성하여 반환하는 메서드라 가정하면
+결국 start() 메서드로 인해 생성되는 빌더는 SimpleJobBuilder이다.
+마지막으로 SimpleJobBuilder의 build() 메서드를 호출하여 빌드하면 비로소 "simpleJob"이라는 이름을
+가진 Job이 생성되어 반환된다.
+
++JobInstance
+JobInstance는 배치에서 Job이 실행될 때 하나의 Job 실행 단위이다.
+만약 하루에 한 번씩 배치의 Job이 실행된다면 어제와 오늘 실행한 각각의 Job을 JobInstance라고 부를 수 있다.
+그렇다면 각각의 JobInstance는 하나의 JobExecution(JobInstance에 대한 한 번의 실행을 나타내는 객체)을 가지고 있을까?
+아니다. 오늘 Job을 실행했는데 실패했다면 다음날 동일한 JobInstance를 가지고 또 실행한다.
+Job 실행이 실패하면 JobInstance가 끝난 것으로 간주하지 않기 때문이다. 그러면 JobInstance는 어제의 실패한 JobExecution과 
+오늘의 성공한 JobExecution 두 개를 가지게 된다. 즉, JobExecution을 여러 개 가질 수 있다.
+
++JobExecution
+JobExecution은 JobInstance에 대한 한 번의 실행을 나타내는 객체이다.
+만약 오늘의 Job이 실패해 내일 다시 동일한 Job이 실행하면 오늘/내일의 실행 모두 같은 JobInstance를 사용할 것이다.
+대신 오늘/내일의 실행은 각기 다른 JobExecution을 생성한다.
+
+실제로 JobExecution 인터페이스를 보면 Job 실행에 대한 정보를 담고 있는 도메인 객체라는 것을 알 수 있다.
+JobExecution은 JobInstance, 배치 실행 상태, 시작 시간, 끝난 시간, 실패했을 때의 메시지 등의 정보를 담고 있다.
+JobExecution 객체 안에 어떤 실행 정보들을 포함하고 있는지 직접 예제를 통해 살펴보자.
+
+spring-batch-core-4.0.1.RELEASE.jar/org/springframework/batch/core/JobExecution.java
+public class JobExecution extends Entity {
+  private final JobParameters jobParameters;
+  private JobInstance jobInstance;
+  private volatile Collection<StepExecution> stepExecutions = Collections.
+          synchronizedSet(new LinkedHashSet<>());
+  private volatile BatchStatus status = BatchStatus.STARTING;
+  private volatile Date startTime = null;
+  private volatile Date createTime = new Date(System.currentTimeMillis());
+  private volatile Date endTime = null;
+  private volatile Date lastUpdated = null;
+  private volatile ExitStatus exitStatus = ExitStatus.UNKNOWN;
+  private volatile ExecutionContext executionContext = new ExecutionContext();
+  private transient volatile List<Throwable> failureExceptions = new
+          CopyOnWriteArrayList<>();
+  private final String jobConfigurationName;
+  ...
+}
+
+- jobParameters : Job 실행에 필요한 매개변수 데이터이다.
+- jobInstance : Job 실행의 단위가 되는 객체이다.
+- stepExecution : StepExecution을 여러 개 가질 수 잇는 Collection 타입이다.
+- status : Job의 실행 상태를 나타내는 필드이다. 상태값은 COMPLETED, STARTING, STARTED, STOPPING, STOPPED, FAILED, ABANDONED, UNKNOWN 등이 
+           있으며 기본값은 STARTING이다.
+- startTime : Job이 실행된 시간이다. null이면 시작하지 않은 것이다.
+- createTime : JobExecution이 생성된 시간이다.
+- endTime : JobExecution이 끝난 시간이다.
+- lastUpdated : 마직막으로 수정된 시간이다.
+- exitStatus : Job 실행결과에 대한 상태를 나타낸다. 상태값은 UNKNOWN, EXECUTING, COMPLETED, NOOP, FAILED, STOPPED 등이 있으며 기본값은 UNKNOWN이다.
+- executionContext : Job 실행 사이에 유지해야 하는 사용자 데이터가 들어 있다.
+- failureExceptions : Job 실행 중 발생한 예외를 List 타입으로 저장한다.
+- jobConfigurationName : Job 설정 이름을 나타낸다.
+
++JobParameters
+JobParameters는 Job이 실행될 때 필요한 파라미터들을 Map 타입으로 저장하는 객체이다.
+JobParameters는 JobInstance를 구분하는 기준이 되기도 한다. 예를 들어 Job 하나를 생성할 때
+시작 시간 등의 정보를 파라미터로 해서 하나의 JobInstance를 생성한다. 
+즉, JobInstance와 JobParameters는 1:1 관계이다. 파라미터의 타입으로는 String, Long, Date, Double을 사용할 수 있다.
+
++Step 
+Step은 실질적인 배치 처리를 정의하고 제어하는 데 필요한 모든 정보가 들어 있는 도메인 객체이다.
+Job을 처리하는 실질적인 단위로 쓰인다. 
+모든 Job에는 1개 이상의 Step이 있어야 한다.
+
++StepExecution
+Job에 JobExecution이라는 Job 실행 정보가 있다면 Step에는 StepExecution이라는 Step 실행 정보를 담은 객체가 있다.
+각각의 Step이 실행될 때마다 StepExecution이 생성된다.
+다음은 StepExecution 클래스이다. 
+
+spring-batch-core-4.0.1.RELEASE.jar/org/springframework/batch/core/StepExecution.java
+public class StepExecution extends Entity {
+   private final JobExecution jobExecution;
+   private final String stepName;
+   private volatile BatchStatus status = BatchStatus.STARTING;
+   private volatile int readCount = 0;
+   private volatile int writeCount = 0;
+   private volatile int commitCount = 0;
+   private volatile int rollbackCount = 0;
+   private volatile int readSkipCount = 0;
+   private volatile int processSkipCount = 0;
+   private volatile int writeSkipCount = 0;
+   private volatile Date startTime = new Date(System.currentTimeMillis());
+   private volatile Date endTime = null;
+   private volatile Date lastUpdated = null;
+   private volatile ExecutionContext executionContext = new ExecutionContext();
+   private volatile ExitStatus exitStatus = ExitStatus.EXECUTING;
+   private volatile boolean terminateOnly;
+   private volatile int filterCount;
+   private transient volatile List<Throwable> failureExceptions = new
+           CopyOnWriteArrayList<Throwable>();
+   ...
+}
+
+- jobExecution : 현재의 JobExecution 정보를 담고 있는 필드이다.
+- stepName : Step의 이름을 가지고 잇는 필드이다.
+- status : Step의 실행 상태를 나타내는 필드이다. 상태값은 COMPLETED, STARTING, STARTED, STOPPING, STOPPED, FAILED, 
+           ABANDONED, UNKNOWN 등이 있으며 기본값은 STARTING이다.
+- readCount : 성공적으로 읽은 레코드 수이다.
+- writeCount : 성공적으로 쓴 레코드 수이다.
+- commitCount : Step의 실행에 대해 커밋된 트랜잭션 수이다.
+- rollbackCount : Step의 실행에 대해 롤백된 트랜잭션 수이다.
+- readSkipCount : 읽기에 실패해 건너뛴 레코드 수이다.
+- processSkipCount : 프로세스가 실패해 건너뛴 레코드 수이다.
+- writeSkipCount : 쓰기에 실패해 건너뛴 레코드 수이다.
+- startTime : Step이 실행된 시간이다. null이면 시작하지 않았다는 것이다.
+- endTime : Step의 실행 성공 여부와 관련 없이 Step이 끝난 시간이다.
+- lastUpdated : 마지막으로 수정된 시간이다.
+- executionContext : Step 실행 사이에 유지해야 하는 사용자 데이터가 들어 잇다.
+- exitStatus : Step 실행 결과에 대한 상태를 나타낸다. 상태값은 UNKNOWN, EXECUTING, COMPLETED, NOOP, FAILED, STOPPED 등이 있으며
+               기본값은 UNKNOWN이다.
+- terminateOnly : Job 실행 중지 여부이다.
+- filterCount : 실행에서 필터링된 레코드 수이다.
+- failureExceptions : Step 실행 중 발생한 예외를 List 타입으로 저장한다.
+
++JobRepository
+JobRepository는 배치 정보를 담고 있는 매커니즘이다.
+어떤 Job이 실행되었으며 몇 번 실행되었고 언제 끝났는지 등 배치처리에 대한 메타데이터를 저장한다.
+예를 들어 Job 하나가 실행되면 JobRepository에서는 배치 실행에 관련된 정보를 담고 있는 도메인인 JobExecution을 생성한다.
+
+JobRepository는 Step의 실행 정보를 담고 있는 StepExecution도 저장소에 저장하며 전체 메타데이터를 저장/관리하는 역할을 수행한다.
+
++JobLauncher
+JobLauncher는 Job, JobParameters와 함께 배치를 실행하는 인터페이스이다. 
+인터페이스의 메서드는 run() 하나이다.
+
+spring-batch-core-4.0.1.RELEASE.jar/org/springframework/batch/core/launch/JobLauncher.java
+public interface JobLauncher {
+  public JobExecution run(Job job, JobParameters jobParameters) throws ...
+}
+
+run() 메서드는 매개변수로 Job과 JobParameters를 받아 JobExecution을 반환한다. 
+만약 매개변수가 이전과 동일하면서 이전에 JobExecution이 중단된 적이 있다면 동일한 JobExecution을 반환한다.
+
++ItemReader
+ItemReader는 Step의 대상이 되는 배치 데이터를 읽어오는 인터페이스이다. 
+FILE, XML, DB 등 여러 타입의 데이터를 읽어올 수 있다.
+spring-batch-infrastructure-4.0.1.RELEASE.jar/org/springframework/batch/item/ItemReader.java
+public interface ItemReader<T> {
+  T read() throws Exception, UnexpectedInputException, ParseException,
+          NonTransientResourceException;
+}
+
+ItemReader에서 read() 메서드의 반환 타입을 제네릭으로 구현했기 때문에 직접 타입을 지정할 수 있다.
+
++ItemProcessor
+ItemProcessor는 ItemReader로 읽어온 배치 데이터를 변환하는 역할을 수행한다.
+굳이 ItemWriter에 변환하는 로직을 넣을 수도 있는데 왜 ItemProcessor를 따로 제공할까?
+그 이유는 두 가지이다. 첫 번째 이유는 비즈니스 로직을 분리하기 위해서이다.
+ItemWriter는 저장만 수행하고, ItemProcessor는 로직 처리만 수행해 역할을 명확하게 분리한다.
+두 번째 이유는 읽어온 배치 데이터와 쓰여질 데이터의 타입이 다를 경우에 대응하기 위해서이다.
+명확한 인풋과 아웃풋을 ItemProcessor로 구현해놓는다면 더 직관적인 코드가 될 것이다.
+
+ItemProcessor 인터페이스 코드이다. 
+제네릭을 사용해 인풋, 아웃풋 타입을 정의하고 비즈니스 로직을 구현한다.
+
+spring-batch-infrastructure-4.0.1.RELEASE.jar/org/springframework/batch/item/ItemProcessor.java
+public interface ItemProcessor<I, O> {
+  O process(I item) throws Exception;
+}
+
++ItemWriter
+ItemWriter는 배치 데이터를 저장한다.
+일반적으로 DB나 파일에 저장한다.
+spring-batch-infrastructure-4.0.1.RELEASE.jar/org/springframework/batch/item/ItemWriter.java
+public interface ItemWriter<T> {
+  void write(List<?, extends T> items) throws Exception;
+}
+
+ItemWriter도 ItemReader와 비슷한 방식으로 구현하면 된다.
+제네릭으로 원하는 타입을 받는다.
+write() 메서드는 List 자료구조를 사용해 지정한 타입의 리스트를 매개변수로 받는다.
+리스트의 데이터 수는 설정한 청크(트랜잭션에서 커밋되는 데이터 개수) 단위로 불러온다.
+write() 메서드의 반환값은 따로 없고 매개변수로 받은 데이터를 저장하는 로직을 구현하면 된다.
+
++스프링 부트 휴면회원 배치 설계하기
+커뮤니티에 가입한 회원 중 1년이 지나도록 상태 변화가 없는 회원을 휴면회원으로 전환하는 배치를 만들어보자.
+Job과 Step을 모두 사용해 구조를 만들 것이다.
+
+Job과 Step은 개발자가 어떻게 구성하느냐에 따라 아주 간단한 로직일 수도 있고 복잡한 비즈니스 로직을 담을 수도 있다.
+최대한 간단한 로직을 담은 배치를 구성해보자.
+
+1. ItemReader -> 2. ItemProcessor -> 3. ItemWriter -> H2
+
+1. H2 DB에 저장된 데이터 중 1년간 업데이트되지 않은 사용자를 찾는 로직을 ItemReader로 구현한다.
+2. 대상 사용자 데이터의 상태값을 휴면회원으로 전환하는 프로세스를 ItemProcessor에 구현한다.
+3. 상태값이 변한 휴면회원을 실제로 DB에 저장하는 ItemWriter를 구현한다. 
+
++스프링 부트 배치 설정하기
+먼저 배치 프로젝트를 생성한다. 
+프로젝트명은 'Spring-Boot-Community-Batch'이다.
+https://github.com/young891221/Spring-Boot-Community-Batch/tree/step1
+
+build.gradle 의존성 설정
+buildscript {
+	ext {
+		springBootVersion = '2.0.3.RELEASE'
+	}
+	repositories {
+		mavenCentral()
+	}
+	dependencies {
+		classpath("org.springframework.boot:spring-boot-gradle-plugin:${springBootVersion}")
+	}
+}
+
+apply plugin: 'java'
+apply plugin: 'eclipse'
+apply plugin: 'org.springframework.boot'
+apply plugin: 'io.spring.dependency-management'
+
+group = 'com.community'
+version = '0.0.1-SNAPSHOT'
+sourceCompatibility = 1.8
+
+repositories {
+	mavenCentral()
+}
+
+
+dependencies {
+	compile('org.springframework.boot:spring-boot-starter-batch')  <-
+	compile('org.springframework.boot:spring-boot-starter-data-jpa')
+	runtime('com.h2database:h2')
+	compileOnly('org.projectlombok:lombok')
+	testCompile('org.springframework.boot:spring-boot-starter-test')
+	testCompile('org.springframework.batch:spring-batch-test')  <-
+}
+
+스프링 부트의 배치 스타터를 사용하면 배치 생성에 필요한 많은 설정을 자동으로 적용할 수 있다.
+스프링 이니셜라이저를 이용하면 spring-batch-test도 함께 생성된다. 
+배치 처리 대부분에 대해 테스트를 실행해봐야 하니 꼭 추가하기 바란다.
+
+휴면회원 배치 처리에 사용될 도메인을 설정한다. 
+휴면 여부를 판별하는 UserStatus Enum을 추가한다.
+ACTIVE는 활성회원, INACTIVE는 휴면회원이다. 
+
+public enum UserStatus {
+    ACTIVE, INACTIVE
+}
+
+public enum SocialType {
+    FACEBOOK("facebook"),
+    GOOGLE("google"),
+    KAKAO("kakao");
+
+    private final String ROLE_PREFIX = "ROLE_";
+    private String name;
+
+    SocialType(String name) {
+        this.name = name;
+    }
+
+    public String getRoleType() { return ROLE_PREFIX + name.toUpperCase(); }
+
+    public String getValue() { return name; }
+
+    public boolean isEquals(String authority) {
+        return this.getRoleType().equals(authority);
+    }
+}
+
+@Getter
+@EqualsAndHashCode(of = {"idx", "email"}) -> 객체의 동등성을 비교하는 Equals()와 HashCode() 메서드를 구현하는 어노테이션이다.
+                                              비교할 필드값으로 유니크한 값인 idx와 email을 설정했다.
+@NoArgsConstructor
+@Entity
+@Table
+public class User implements Serializable {
+
+    @Id
+    @Column
+    @GeneratedValue
+    private Long idx;
+
+    @Column
+    private String name;
+
+    @Column
+    private String password;
+
+    @Column
+    private String email;
+
+    @Column
+    private String pincipal;
+
+    @Column
+    @Enumerated(EnumType.STRING)    -> 유저 상태값
+    private SocialType socialType;
+
+    @Column
+    @Enumerated(EnumType.STRING)
+    private UserStatus status;
+
+    @Column
+    private LocalDateTime createdDate;
+
+    @Column
+    private LocalDateTime updatedDate;
+
+    @Builder
+    public User(String name, String password, String email, String pincipal, SocialType socialType, UserStatus status, LocalDateTime createdDate, LocalDateTime updatedDate) {
+        this.name = name;
+        this.password = password;
+        this.email = email;
+        this.pincipal = pincipal;
+        this.socialType = socialType;
+        this.status = status;
+        this.createdDate = createdDate;
+        this.updatedDate = updatedDate;
+    }
+
+    public User setInactive() {   -> User가 휴면회원으로 판정된 경우 status 필드값을 휴면으로 전환하는 메서드를 추가했다.
+        status = UserStatus.INACTIVE;
+        return this;
+    }
+}
+
++스프링 부트 휴면회원 배치 구현하기
+구현순서는 다음과 같다.
+
+1. 휴면회원 배치 테스트 코드 생성
+2. 휴면회원 배치 정보 설정
+3. SQL로 테스트 데이터 주입하기
+
++휴면회원 배치 테스트 코드 생성
+먼저 JobLauncherTestUtils를 빈으로 등록해 테스트 설정 클래스를 작성한다.
+JobLaucherTestUtils는 배치의 Job을 실행해 테스트하는 유틸리티 클래스이다.
+
+/com/community/batch/TestJobConfig.java
+package com.community.batch;
+
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.test.JobLauncherTestUtils;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@EnableBatchProcessing -> @EnableBatchProcessing은 스프링 부트 배치 스타터에 미리 정의된 설정들을 실행시키는 마법의 어노테이션이다. 
+                          배치에 필요한 JobBuilder, JobRepository, JobLauncher 등 다양한 설정이 자동으로 주입된다.
+@Configuration
+public class TestJobConfig {
+
+    @Bean
+    public JobLauncherTestUtils jobLauncherTestUtils() {
+        return new JobLauncherTestUtils(); -> Job 실행에 필요한 JobLauncher를 필드값으로 갖는 JobLauncherTestUtils를 빈으로 등록한다.
+    }
+}
+
+휴면회원 전환기능을 구현하기 전에 휴면전환이 올바르게 되었는지 확인하는 테스트 코드를 먼저 작성하자.
+
+package com.community.batch;
+
+import com.community.batch.domain.enums.UserStatus;
+import com.community.batch.repository.UserRepository;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.springframework.batch.core.BatchStatus;
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.test.JobLauncherTestUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.junit4.SpringRunner;
+
+import java.time.LocalDateTime;
+
+import static org.junit.Assert.assertEquals;
+
+@RunWith(SpringRunner.class)
+@SpringBootTest
+public class InactiveUserJobTest {
+
+	@Autowired
+	private JobLauncherTestUtils jobLauncherTestUtils;
+
+	@Autowired
+	private UserRepository userRepository;
+
+	@Test
+	public void 휴면_회원_전환_테스트() throws Exception {
+		JobExecution jobExecution = jobLauncherTestUtils.launchJob(); -> lauchJob() 메서드로 Job을 실행시켰다. lauchJob() 메서드의 반환값으로 실행 결과에 대한 정보를 담고
+		                                                                 있는 JobExecution이 반환된다.
+
+		assertEquals(BatchStatus.COMPLETED, jobExecution.getStatus()); -> getStatus() 값이 COMPLETED로 출력되면 Job의 실행 여부 테스트는 성공이다.
+		assertEquals(0, userRepository.findByUpdatedDateBeforeAndStatusEquals(LocalDateTime.now().minusYears(1), UserStatus.ACTIVE).size());
+		-> 업데이트된 날짜가 1년 전이며 User 상태값이 ACTIVE인 사용자들이 없어야 휴면회원 배치 테스트가 성공이다.
+	}
+
+}
+
+테스트 코드를 먼저 작성했다. 
+객체를 찾을 수 없다고 경고가 표시될 것이다.
+필요한 객체를 하나씩 추가해가며 휴면회원 전환 기능을 구현해보자.
+
+제일 먼전 휴면회원의 대상이 되는 User 리스트를 불러와야 한다.
+휴면회원의 대상은 수정된지 1년이 지났으며 상태값이 ACTIVE인 사용자이다.
+이 조건을 실행하는 쿼리 메서드를 UserRepository를 생성해 추가하자.
+
+package com.community.batch.repository;
+
+import com.community.batch.domain.User;
+import com.community.batch.domain.enums.UserStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+/**
+ * Created by youngjae on 2018. 3. 3..
+ */
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+    List<User> findByUpdatedDateBeforeAndStatusEquals(LocalDateTime localDateTime, UserStatus status);
+}
+
+findByUpdateDateBeforeAndStatusEquals() 메서드는 인자값으로 LocalDateTime, 즉 현재 기준 날짜값보다 1년 전의 날짜값을 받고
+두 번째 인자값으로 UserStatus 타입을 받아 쿼리를 실행하는 메서드이다.
+
+이제 테스트 코드에서 빨간색 에러 표시가 없어졌을 것이다.
+테스트 코드의 경고는 없어졌지만 제일 중요한 Job에 대한 설정이 아직 없다.
+
++휴면회원 배치 정보 설정
+Job 설정을 만들어보자.
+
+1. 휴면회원 Job 설정
+2. 휴면회원 Step 설정
+3. 휴면회원 Reader, Processor, Writer 설정
+
+배치정보는 @Configuration 어노테이션을 사용하는 설정 클래스에 빈으로 등록한다.
+
+휴면회원 배치 Job빈으로 등록(휴면회원 배치 Job 생성 메서드 추가)
+package com.community.batch.jobs;
+
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
+import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import lombok.AllArgsConstructor;
+
+/**
+ * Created by KimYJ on 2018-03-07.
+ */
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+
+    private UserRepository userRepository;
+
+    @Bean
+    public Job inactiveUserJob(JobBuilderFactory jobBuilderFactory, Step inactiveJobStep) { -> Job 생성을 직관적이고 편리하게 도와주는 빌더인 JobBuilderFactory를 주입했다.
+                                                                                               빈에 주입할 객체를 파라미터로 명시하면 @Autowired 어노테이션을 쓰는 것과 같은 
+											       효과가 있다.
+                                                                                               
+        return jobBuilderFactory.get("inactiveUserJob")
+                .preventRestart()  -> JobBuilderFactory의 get("inactiveUserJob")은 "inactiveUserJob"이라는 이름의 JobBuilder를 생성하며, preventRestart()는 Job의 재실행을 막는다.
+                .start(inactiveJobStep) -> start(inactiveJobStep)은 파리머터에서 주입받은 휴면회원 관련 Step인 inactiveJobStep을 제일 먼저 실행하도록 설정하는 부분이다.
+		                           inactiveJobStep은 앞선 inactiveUserJob과 같이 InactiveUserJobConfig 클래스에 빈으로 등록할 것이다.
+                .build();
+    }
+
+}
+
+기본적인 Job 설정을 완료했다.
+이제 Step을 설정하자.
+
+휴면회원 배치 Step 빈으로 등록(휴면회원 배치 Step 생성 메서드 추가)
+
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+
+  ...
+  
+  @Bean
+    public Step inactiveJobStep(StepBuilderFactory stepBuilderFactory) {
+        return stepBuilderFactory.get("inactiveUserStep") -> StepBuilderFactory의 get("inactiveUserStep")은 "inactiveUserStep"이라는 이름의 StepBuilder를 생성한다.
+                .<User, User> chunk(10) -> 제네릭을 사용해 chunk()의 입력 타입과 출력 타입을 User 타입으로 설정했다. chuck의 인자값을 10으로 설정했는데 쓰기 시에 청크 단위로
+		                           묶어서 writer() 메서드를 실행시킬 단위를 지정한 것이다. 즉, 커밋의 단위가 10개이다.
+                .reader(inactiveUserReader())  -> Step의 reader, processor, writer를 각각 설정했다.
+                .processor(inactiveUserProcessor())
+                .writer(inactiveUserWriter())
+                .build();
+    }
+}
+
+휴면회원 배치 Reader 빈으로 등록(휴면회원 배치 Reader 생성 메서드 추가)
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+
+    @Bean
+    @StepScope -> 기본 빈 생성은 싱글턴이지만 @StepScope를 사용하면 해당 메서드는 Step의 주기에 따라 새로운 빈을 생성한다.
+                  즉, 각 Step의 실행마다 새로 빈을 만들기 때문에 지연 생성(참조형 변수의 메모리 할당을 변수를 선언하는 시점에 하지 않고
+		  처음 사용되는 시점에 하는 것. 메모리를 아낄 수 있다.(https://m.blog.naver.com/PostView.naver?isHttpsRedirect=true&blogId=jinhyuk2174&logNo=70189726985))이 
+		  가능하다. 주의할 사항은 @StepScope는 기본 프록시 모드가 반환되는 클래스 타입을 참조하기 때문에 @StepScope를 사용하면 반드시 구현된 반환 타입을 명시해 반환해야 한다.
+		  예제에서는 반환 타입을 QueueItemReader<User>라고 명시했다.
+		
+    public QueueItemReader<User> inactiveUserReader() { 
+        List<User> oldUsers = userRepository.findByUpdatedDateBeforeAndStatusEquals(LocalDateTime.now().minusYears(1), UserStatus.ACTIVE);
+	-> findByUdpatedDateBeforeAndStatusEquals() 메서드는 현재 날짜 기준 1년 전의 날짜값과 User의 상태값이 ACTIVE인 User 리스트를 불러오는 쿼리이다.
+        return new QueueItemReader<>(oldUsers); -> QueueItemReader 객체를 생성하고 불러온 휴면회원 타깃 대상 데이터를 객체에 넣어 반환한다.
+    }
+}
+
+QueueItemReader 객체를 굳이 만들어서 사용할 필요없이 ListItemReader 구현체를 사용해도 동일한 효과를 얻을 수 있다. 
+여기서는 어떻게 ItemReader를 직접 구현하여 사용할 수 있는지 알아보겠다.
+QueueItemReader 객체를 별도로 생성해보자.
+
+큐를 사용한 Reader 객체 QueueItemReader
+package com.community.batch.jobs.readers;
+
+import org.springframework.batch.item.ItemReader;
+import org.springframework.batch.item.NonTransientResourceException;
+import org.springframework.batch.item.ParseException;
+import org.springframework.batch.item.UnexpectedInputException;
+
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Queue;
+
+/**
+ * Created by KimYJ on 2018-03-26.
+ */
+public class QueueItemReader<T> implements ItemReader<T> {
+    private Queue<T> queue;
+
+    public QueueItemReader(List<T> data) {
+        this.queue = new LinkedList<>(data); -> QueueItemReader를 사용해 휴면회원으로 지정될 타깃 데이터를 한번에 불러와 큐에 담는다.
+    }
+
+    @Override
+    public T read() throws Exception, UnexpectedInputException, ParseException, NonTransientResourceException {
+        return this.queue.poll(); -> read() 메서드를 사용할 때 큐의 poll() 메서드를 사용하여 큐에서 데이터를 하나씩 반환한다.
+    }
+}
+
+QueueItemReader는 이름 그대로 큐를 사용해 저장하는 ItemReader 구현체이다.
+ItemReader의 기본 반환 타입은 단수형인데 그에 따라 구현하면 User 객체 1개씩 DB에
+select 쿼리를 요청하므로 매우 비효율적이다.
+
+데이터를 DB에서 읽어와 QueueItemReader에 저장하였으므로 이제 읽어온 타깃 데이터를 휴면회원으로 전환시키는 processor를 만든다.
+
+휴면회원으로 전환시키는 inactiveUserProcessor 생성 
+/**
+ * Created by KimYJ on 2018-03-07.
+ */
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+   ...
+
+    public ItemProcessor<User, User> inactiveUserProcessor() {
+        //return User::setInactive;
+        return new ItemProcessor<User, User>() {
+            @Override
+            public User process(User user) throws Exception {
+                return user.setInactive();
+            }
+        };
+    }
+}
+
+reader에서 읽은 User를 휴면 상태로 전환하는 processor 메서드를 추가하는 예이다. 
+주석처리된 부분은 자바 8의 메서드 레퍼런스를 사용해서 간단하게 표현하는 로직이다.
+위에서는 ItemProcessor를 구현하는 코드를 추가했다.
+
+휴면회원 전환 처리를 담당하는 processor 구현을 마쳤으니 휴면회원을 DB에 저장하느 inactiveUserWriter를 구현한다.
+
+휴면회원을 DB에 저장하는 inactiveUserWriter 생성 메서드 추가
+
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+  ...
+  public ItemWriter<User> inactiveUserWriter() {
+        return ((List<? extends User> users) -> userRepository.saveAll(users));
+  }
+}
+
+ItemWriter는 리스트 타입을 앞서 설정한 청크 단위로 받는다.
+청크 단위를 10으로 설정했으므로 users에는 휴면회원 10개가 주어지며 saveAll() 메서드를 사용해서 한번에 DB에 저장한다.
+
+드디어 휴면회원 처리 로직이 완성되었다.
+전체 InactiveUserJobConfig 클래스 코드는 다음과 같다.
+
+package com.community.batch.jobs;
+
+import com.community.batch.domain.User;
+import com.community.batch.domain.enums.UserStatus;
+import com.community.batch.jobs.readers.QueueItemReader;
+import com.community.batch.repository.UserRepository;
+
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
+import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+import lombok.AllArgsConstructor;
+
+/**
+ * Created by KimYJ on 2018-03-07.
+ */
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+
+    private UserRepository userRepository;
+
+    @Bean
+    public Job inactiveUserJob(JobBuilderFactory jobBuilderFactory, Step inactiveJobStep) {
+        return jobBuilderFactory.get("inactiveUserJob")
+                .preventRestart()
+                .start(inactiveJobStep)
+                .build();
+    }
+
+    @Bean
+    public Step inactiveJobStep(StepBuilderFactory stepBuilderFactory) {
+        return stepBuilderFactory.get("inactiveUserStep")
+                .<User, User> chunk(10)
+                .reader(inactiveUserReader())
+                .processor(inactiveUserProcessor())
+                .writer(inactiveUserWriter())
+                .build();
+    }
+
+    @Bean
+    @StepScope
+    public QueueItemReader<User> inactiveUserReader() {
+        List<User> oldUsers = userRepository.findByUpdatedDateBeforeAndStatusEquals(LocalDateTime.now().minusYears(1), UserStatus.ACTIVE);
+        return new QueueItemReader<>(oldUsers);
+    }
+
+    public ItemProcessor<User, User> inactiveUserProcessor() {
+        return User::setInactive;
+        /*return new ItemProcessor<User, User>() {
+            @Override
+            public User process(User user) throws Exception {
+                return user.setInactive();
+            }
+        };*/
+    }
+
+    public ItemWriter<User> inactiveUserWriter() {
+        return ((List<? extends User> users) -> userRepository.saveAll(users));
+    }
+}
+
+모든 구현을 마쳤지만 빨간색 에러가 나는 부분이 있을 것이다.
+설정 클래스에서 JobBuilderFactory, StepBuilderFactory를 자동으로 주입받기 위해서는 애플리케이션을 구동하는 BatchApplication 클래스에 
+@EnableBatchProcessing 어노테이션을 설정해주어야 한다.
+@EnableBatchProcessing 어노테이션은 배치 작업에 필요한 빈을 미리 등록하여 사용할 수 있도록 해준다.
+
+BatchApplication 클래스에 @EnableBatchProcessing 어노테이션 추가
+@SpringBootApplication
+@EnableBatchProcessing <-
+public class BatchApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(BatchApplication.class, args);
+	}
+}
+
++SQL로 테스트 데이터 주입하기
+지금까지 테스트 데이터 등록은 CommandLineRunner를 사용해서 애플리케이션이 시작될 때 생성하여 저장하는 방식이었다.
+이번에는 스프링 부트에서 SQL 파일을 이용해서 테스트 데이터를 생성하여 저장해본다.
+
+다음과 같이 휴면회원의 대상에 대한 데이터 삽입 쿼리를 파일로 생성한다.
+
+/resources/import.sql
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1001, 'test@test.com', 'test1', 'test1', 'FACEBOOK', 'ACTIVE', 'VIP', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1002, 'test@test.com', 'test2', 'test2', 'FACEBOOK', 'ACTIVE', 'VIP', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1003, 'test@test.com', 'test3', 'test3', 'FACEBOOK', 'ACTIVE', 'VIP', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1004, 'test@test.com', 'test4', 'test4', 'FACEBOOK', 'ACTIVE', 'GOLD', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1005, 'test@test.com', 'test5', 'test5', 'FACEBOOK', 'ACTIVE', 'GOLD', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1006, 'test@test.com', 'test6', 'test6', 'FACEBOOK', 'ACTIVE', 'GOLD', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1007, 'test@test.com', 'test7', 'test7', 'FACEBOOK', 'ACTIVE', 'FAMILY', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1008, 'test@test.com', 'test8', 'test8', 'FACEBOOK', 'ACTIVE', 'FAMILY', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1009, 'test@test.com', 'test9', 'test9', 'FACEBOOK', 'ACTIVE', 'FAMILY', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1010, 'test@test.com', 'test10', 'test10', 'FACEBOOK', 'ACTIVE', 'FAMILY', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+insert into user (idx, email, name, password, social_type, status, grade, created_date, updated_date)
+values (1011, 'test@test.com', 'test11', 'test11', 'FACEBOOK', 'ACTIVE', 'FAMILY', '2016-03-01T00:00:00', '2018-03-01T00:00:00');
+
+/resources 하위 경로에 import.sql 파일을 생성해놓으면 스프링 부트가 실행될 때 자동으로 해당 파일의 쿼리를 실행한다.
+더 정확히 구분해 말하자면 import.sql은 하이버네이트가, data.sql은 스프링 JDBC가 실행한다.
+
+휴면회원 배치에 대한 모든 준비를 마쳤다.
+위에서 작성한 테스트 코드를 실행해보자.
+성공할 것이다.
+

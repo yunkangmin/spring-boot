@@ -1,0 +1,864 @@
++스프링 배치 심화
+스프링 배치 글에서 만든 배치 처리 과정을 더 능동적으로 테스트하는 환경으로 바꿔보겠다.
+ 
+ 1. 다양한 ItemReader 구현 클래스
+ 2. 다양한 ItemWriter 구현 클래스
+ 3. JobParameter 사용하기
+ 4. 테스트 시에만 H2 DB를 사용하도록 설정하기
+ 5. 청크 지향 프로세싱
+ 6. 배치의 인터셉터 Listener 설정하기
+ 7. 어노테이션 기반으로 Listener 설정하기
+ 8. Step의 흐름을 제어하는 Flow
+ 
+ 소스코드
+ https://github.com/young891221/Spring-Boot-Community-Batch/tree/step2
+ 
++다양한 ItemReader 구현 클래스
+스프링 배치 글에서 테스트 코드는 성공했지만 몇 가지 해결 과제가 남았다.
+바로 배치에서 제공하는 구현 클래스의 기능을 확장하는 일이다.
+
+스프링 배치 글에서 InactiveUserJobConfig 코드를 다른 방식으로 수정해보자.
+스프링 배치 프로젝트에서는 각각의 상황에 맞는 다한 ItemReader 구현체를 제공한다.
+그 중 하나가 리스트 타입으로 Reader를 구현한 ListItemReader 객체이다.
+스프링 배치 글에서 QueueItemReader 객체와 동일한 역할을 수행한다.
+
+...
+import org.springframework.batch.item.support.ListItemReader;
+
+@Configuration
+@AllArgsConstructor
+public class InactiveUserJobConfig {
+   ...
+
+    @Bean
+    @StepScope
+    public ListItemReader<User> inactiveUserReader() {
+        List<User> oldUsers = 
+              userRepository.findByUpdatedDateBeforeAndStatusEquals(
+              LocalDateTime.now().minusYears(1), UserStatus.ACTIVE);
+        return new ListItemReader<>(oldUsers);
+    }
+
+}
+
+ListItemReader 객체를 사용하도록 구현했으니 QueueItemReader 객체는 삭제해도 된다.
+ListItemReader 객체를 사용하면 모든 데이터를 한번에 가져와 메모리에 올려놓고 read() 메서드로 하나씩 배치 처리 작업을 수행할 수 있다.
+
+그런데 수백, 수천을 넘어 수십만 개 이상의 데이터를 한번에 가져와 메모리에 올려놓아야 할 때는 어떻게 해야 할까?
+이 때는 배치 프로젝트에서 제공하는 PagingItemReader 구현체를 사용할 수 있다.
+구현체는 크게 JdbcPagingItemReader, JpaPagingItemReader, HibernatePagingItemReader가 있다.
+지금은 JPA를 사용하고 있으므로 JpaPagingItemReader를 사용하겠다.
+JpaPagingItemReader에는 지정한 데이터 크기만큼 DB에서 읽어오는 setPageSize() 메서드라는 기능이 있다.
+즉, 모든 데이터를 한번에 가져오는 것이 아니라 지정한 단위로 가져와 배치 처리를 수행한다.
+다음 코드를 보자.
+
+JpaPagingItemReader를 사용해 원하는 크기만큼 읽어오기
+@Configuration
+@AllArgsConstructor
+public class InactiveUserJobConfig {
+    private final static int CHUNK_SIZE = 15;
+    private final EntityManagerFactory entityManagerFactory;
+
+    ...
+
+    @Bean
+    public Step inactiveJobStep(StepBuilderFactory stepBuilderFactory, JpaPagingItemReader<User> inactiveUserJpaReader, InactiveChunkListener inactiveChunkListener) {
+        return stepBuilderFactory.get("inactiveUserStep")
+                .<User, User> chunk(CHUNK_SIZE)
+                .reader(inactiveUserJpaReader)
+                .processor(inactiveUserProcessor())
+                .writer(inactiveUserWriter())
+                .listener(inactiveChunkListener)
+                .build();
+    }
+    
+    ...
+
+    @Bean(destroyMethod="") -> 스프링에서 destroyMethod를 사용해 삭제할 빈을 자동으로 추적한다.
+                               destroyMethod=""와 같이 하여 기능을 사용하지 않도록 설정하면 실행 시 출력되는 다음과 같은 waring 메시지를 삭제할 수 있다.
+                               Invocation of destroy method 'close' failed on bean with name 'scopedTarget/
+                               inactiveUserJpaReader': org.springframework.batch.item.ItemStreamException: Error while closing item reader
+    @StepScope
+    public JpaPagingItemReader<User> inactiveUserJpaReader() {
+        JpaPagingItemReader<User> jpaPagingItemReader = new JpaPagingItemReader<>();
+        //JpaPagingItemReader를 사용하려면 안타깝게도 쿼리를 직접 짜서 실행하는 방법밖에는 없다. 
+        //마지막 정보 갱신 일자를 나타내는 updatedDate 파라미터와 상태값을 나타내는 status 파라미터를 사용해 쿼리를 작성한다.
+        jpaPagingItemReader.setQueryString("select u from User as u where u.updatedDate < :updatedDate and u.status = :status");        
+        Map<String, Object> map = new HashMap<>();
+        LocalDateTime now = LocalDateTime.now();
+        map.put("updatedDate", now.minusYears(1));
+        map.put("status", UserStatus.ACTIVE);
+        jpaPagingItemReader.setParameterValues(map); -> 쿼리에서 사용된 updatedDate, status 파라미터를 Map에 추가해 사용할 파라미터를 설정한다.
+        jpaPagingItemReader.setEntityManagerFactory(entityManagerFactory); -> 트랜잭션을 관리해 줄 entityManagerFactory를 설정한다.
+        jpaPagingItemReader.setPageSize(CHUNK_SIZE); -> 한번에 읽어올 크기를 15개로 설정한다.
+        return jpaPagingItemReader;
+    }
+ }
+ 
+설정이 끝났다. 테스트 코드를 실행해 정상적으로 동작하는지 확인해보자.
+ 
+JpaPagingItemReader를 사용할 경우 한 가지 주의사항이 있다. 
+위에서 설정한 CHUNK_SIZE이다.
+JpaPagingItemReader는 내부에 entityManager를 할당받아 사용하는데 지정한 크기로 데이터를 읽어온다.
+만약 inactiveJobStep()에서 설정한 청크 단위(커밋단위)가 5라고 가정하면 Item 5개를 writer까지 배치 처리를 진행하고 저장한다고 해보자.
+저장된 데이터를 바탕으로 다음에 다시 지정한 크기로 새 인덱스를 할당해 읽어 와야 하는데 이전에 진행한 5라는 인덱스값을 그대로 사용해
+데이터를 불러오도록 로직이 짜여 있어서 문제가 된다.
+예를 들어 청크 단위로 Item 5개를 커밋하고 다음 청크 단위로 넘어가야 하는 경우를 가정해보자.
+하지만 entityManager에서 앞서 처리된 Item 5개 때문에 새로 불러올 Item의 인덱스 시작점이 5로 설정되어 있게 된다.
+그러면 쿼리 요청 시 offset 5(인덱스값), limit 5(지정한 크기 단위)이므로 개념상 바로 다음 청크 단위(Item 5)인 Item을 건너뛰는 상황이 발생한다.
+이러한 상황에서 가장 간단한 해결 방법은 조회용 인덱스값을 항상 0으로 반환하는 것이다.
+0으로 반환하면 Item 5개를 수정하고 다음 5개를 건너뛰지 않고 원하는 순서/청크 단위로 처리가 가능해진다.
+
+JpaPagingItemReader가 항상 인덱스 0을 반환하도록 수정
+@Configuration
+@AllArgsConstructor
+public class InactiveUserJobConfig {
+   ...
+
+    @Bean(destroyMethod="")
+    @StepScope
+    public JpaPagingItemReader<User> inactiveUserJpaReader() {
+        JpaPagingItemReader<User> jpaPagingItemReaer = new JpaPagingItemReader() {
+           @Override
+           public int getPage() {
+              return 0;
+           }
+        };
+        ...
+    }
+    ...
+}
+
+이외에도 JdbcPagingItemReader, HibernateItemReader 등 다양한 Reader 구현체가 있다.
+상황에 맞게 알맞은 구현체를 선택해 사용하자.
+
++다양한 ItemWriter 구현 클래스
+스프링 부트 배치 글에서는 직접 ItemWriter를 구현해 사용했다. 
+ItemWriter도 ItemReader와 마찬가지로 상황에 맞는 여러 구현 클래스를 제공한다.
+여기서는 JPA를 사용하고 있으므로 JpaItemWriter를 적용한다.
+
+JpaItemWriter 추가
+@Configuration
+@AllArgsConstructor
+public class InactiveUserJobConfig {
+    ...
+    private JpaItemWriter<User> inactiveUserWriter() {
+        JpaItemWriter<User> jpaItemWriter = new JpaItemWriter<>();
+        jpaItemWriter.setEntityManagerFactory(entityManagerFactory);
+        return jpaItemWriter;
+    }
+}
+
+JpaItemWriter는 별도로 저장 설정을 할 필요 없이 제네릭에 저장할 타입을 명시하고
+EntityManagerFactory만 설정하면 Processor에서 넘어온 데이터를 청크 단위로 저장한다.
+
+이 밖에도 HibernateItemWriter, JdbcBatchItemWriter 등 여러 Writer 구현 클래스가 있다.
+상황에 맞게 선택해 사용하면 된다.
+
++JobParameter 사용하기
+JobParameter를 사용해 Step을 실행시킬 때 동적으로 파라미터를 주입시킬 수 있다.
+자세한 내용은 스프링 부트 배치 글에서 Job 부분을 다시 한번 보자.
+JobParameter를 어덯게 사용하는지 알아보자.
+휴면회원으로 전환하는 배치로직에서 현재 시간 기준으로 1년 전의 날짜를 값으로 사용해 휴면전환 User를 조회했다.
+이 경우 청크 단위로 Reader가 실행될 때마다 미세하게 현재 날짜값이 차이날 수 있다.
+JobParameter에 현재 시간을 주입해 Reader가 실행될 때마다 모두 동일한 시간을 참조하게 설정해보자.
+
+먼저 테스트 코드에 JobParameter를 생성해 JobLauncher에 전달하게끔 수정한다.
+
+현재 시간에 대한 JobParameter 생성
+@RunWith(SpringRunner.class)
+@SpringBootTest
+@AutoConfigureTestDatabase(connection = EmbeddedDatabaseConnection.H2)
+public class InactiveUserJobTest {
+
+	@Autowired
+	private JobLauncherTestUtils jobLauncherTestUtils;
+
+	@Autowired
+	private UserRepository userRepository;
+
+	@Test
+	public void 휴면_회원_전환_테스트() throws Exception {
+		Date nowDate = new Date(); -> 현재 날짜를 Date 타입으로 생성한다. Date 타입은 JobParameter에서 허용하는 파라미터 중 하나이다.
+  
+  //JobParametersBuilder를 사용하면 간편하게 JobParameters를 생성할 수 있다.
+  //JobParameters는 여러 JobParameter를 받는 객체이다.
+  //JobLauncher를 사용하려면 JobParameters가 필요하다.
+		JobExecution jobExecution = jobLauncherTestUtils.launchJob(new JobParametersBuilder().addDate("nowDate", nowDate).toJobParameters());
+
+		assertEquals(BatchStatus.COMPLETED, jobExecution.getStatus());
+		assertEquals(11, userRepository.findAll().size());
+		assertEquals(0, userRepository.findByUpdatedDateBeforeAndStatusEquals(LocalDateTime.now().minusYears(1), ACTIVE).size());
+	}
+}
+
+주입된 JobParameter를 실질적으로 사용하도록 코드를 수정하자.
+inactiveUserReader() 메서드를 다음과 같이 수정한다.
+
+inactiveUserReader() 메서드에서 JobParameter 사용하기
+@Configuration
+@AllArgsConstructor
+public class InactiveUserJobConfig {
+ ...
+  @Bean
+    public Step inactiveJobStep(StepBuilderFactory stepBuilderFactory, ListItemReader<User> inactiveUserReader, InactiveChunkListener inactiveChunkListener) {
+        return stepBuilderFactory.get("inactiveUserStep")
+                .<User, User> chunk(CHUNK_SIZE)
+                .reader(inactiveUserReader)
+                .processor(inactiveUserProcessor())
+                .writer(inactiveUserWriter())
+                .listener(inactiveChunkListener)
+                .build();
+    }
+
+    @Bean
+    @StepScope
+    //SpEL을 사용해 JobParameters에서 nowDate 파라미터를 전달받는다.
+    //Date 타입으로 주입해서 곧바로 Date 타입으로 전달받을 수 있다.
+    public ListItemReader<User> inactiveUserReader(@Value("#{jobParameters[nowDate]}") Date nowDate, UserRepository userRepository) {
+        
+        //전달받은 현재 날짜값을 UserRepository에서 사용할 수 있는 타입인 LocalDateTime으로 전환한다.
+        LocalDateTime now = LocalDateTime.ofInstant(nowDate.toInstant(), ZoneId.systemDefault());
+        List<User> inactiveUsers = userRepository.findByCreatedDateBeforeAndStatusEquals(now.minusYears(1), UserStatus.ACTIVE);
+        return new ListItemReader<>(inactiveUsers);
+    }
+    ...
+ }
+ 
+ JobParameter를 사용할 수 있도록 코드 수정이 끝났다.
+ 이제는 모든 배치 리가 동일한 날짜값을 기준으로 동작한다.
+ 
++테스트 시에만 H2 데이터베이스를 사용하도록 설정하기
+현재까지는 H2를 사용해 메모리에 데이터를 올려놓고 테스트했다.
+하지만 MySQL을 사용하는 데 테스트에 H2를 사용하고 싶다면 어떻게 해야할까? 간단하다.
+
+우선 build.gradle 파일에 MySQL 런타임 의존성을 추가 설정한다.
+
+MySQL 의존성 추가
+...
+dependencies {
+ compile('org.springframework.boot:spring-boot-starter-batch')
+ compile('org.springframework.boot:spring-boot-starter-data-jpa')
+ runtime('com.h2database:h2')
+ runtime('mysql:mysql-connector-java')
+ compileOnly('org.projectlombok:lombok')
+ testCompile('org.springframework.boot:spring-boot-starter-test')
+ testCompile('org.springframework.batch:spring-batch-test')
+}
+
+이와 같이 스프링 부트에서는 의존성, 프로퍼티 설정만 하면 간단하게 MySQL을 연동시킬 수 있다.
+
+다음으로 application.yml에 datasource 프로퍼티를 추가해 배치 애플리케이션 실행 시 MySQL이 적용되어 실행되게 해보자.
+
+application.yml에 MySQL을 사용하도록 설정
+spring:
+   datasource:
+      url: jdbc:mysql://127.0.0.1:3306/{DB명}
+      username: {아이디}
+      password: {패스워드}
+      driver-class-name: com.mysql.jdbc.Driver
+   jpa:
+      show-sql: true
+      hibernate:
+         ddl-auto: create #테스트용 테이블 생성 설정
+    ...
+ 
+ DB명, 아이디, 패스워드에 알맞은 정보를 넣는다. 
+ 이제 배치 애플리케이션 실행에는 MySQL이 기본 데이터베이스로 할당되어 사용된다.
+ 주의할 점은 만약 실제 서비스를 운영하는 프로젝트를 개발한다면 위와 같이 jpa.hibernate.ddl-auto = create 설정을
+ 그대로 사용하면 안된다.
+ 설정을 그대로 사용하면 애플리케이션을 재기동할 때마다 테이블이 삭제되고 새로 생성된다.
+ 
+ 실제로는 MySQL을 사용하지만 @AutoConfigureTestDatabase 어노테이션을 사용하면 테스트 시에는 H2를 할당하게 처리할 수 있다.
+ 
+ @AutoConfigureTestDatabase를 사용해서 테스트 데이터베이스 설정
+ ...
+ import org.springframework.boot.jdbc.EmbeddedDatabaseConnection;
+ import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+ 
+ @RunWith(SpringRunner.class)
+ @SpringBootTest
+ @AutoConfigureTestDatabase(connection = EmbeddedDatabaseConnection.H2)  <-
+ public class InactiveUserJobTest {
+    ...
+ }
+ 
+ @AutoConfigureTestDatabase 어노테이션은 datasource 프로퍼티를 기반으로 자동으로 설정된 데이터베이스를
+ 무시하고 테스트용 클래스에서 사용할 데이터베이스가 적용되게끔 하는 어노테이션이다.
+ 예제에서와 같이 connection 설정에 H2, DERBY, HSQL 등의 테스트 데이터 베이스를 설정할 수 있다.
+ 
++청크 지향 프로세싱
+청크 지향 프로세싱은 트랜잭션 경계 내에서 청크 단위로 데이터를 읽고 생성하는 프로그래밍 기법이다.
+청크란 아이템이 트랜잭션에서 커밋되는 수를 말한다.
+read한 데이터 수가 지정한 청크 단위와 일치하면 write를 수행하고 트랜잭션을 커밋한다.
+스프링 부트배치 글의 Step 설정에서 chunk()로 커밋 단위를 지정했던 부분이다. 
+예제에서 쭉 해왓던 방식이 청크 지향 프로세싱이었다.
+
+그렇다면 청크 지향 프로세싱의 이점은 무엇일까?
+1000여 개의 데이터에 대해 배치 로직을 실행한다고 가정해보자.
+청크로 나우지 않았을 때는 하나만 실패해도 다른 성공한 999개의 데이터가 롤백된다.
+그런데 청크 단위를 10으로 해서 배치 처리를 하면 도중에 배치 처리에 실패하더라도
+다른 청크는 영향을 받지 않는다. 
+이러한 이유로 스프링 배치에서는 청크 단위의 프로그래밍을 지향한다.
+
+그렇다면 반대로 청크 지향 프로세싱이 아닌 방식은 무엇일까?
+여기에는 Tasklet을 사용한 방식이 있다. 
+Tasklet은 임의의 Step을 실행할 때 하나의 작업으로 처리하는 방식이다.
+읽기, 처리, 쓰기로 나뉜 방식이 청크 지향 프로세싱이라면 이를 단일 작업으로 만드는 개념이 Tasklet이다.
+
+코드를 보면서 이해해보자.
+먼저 Tasklet 인터페이스를 살펴보자.
+
+spring-batch-core-4.0.1.RELEASE.jar/org/springframework/batch/core/step/tasklet/Tasklet.java
+public interface Tasklet {
+   RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) 
+      throws Exception;
+}
+
+Tasklet 인터페이스는 execute() 메서드 하나만 제공한다.
+내부에 원하는 단일 작업을 구현하고 작업이 끝나면 RepeatStatus.FINISHED를 반환하고 작업이 계속된다면 
+RepeatStatus.CONTINUBLE을 반환한다.
+
+휴면회원 배치 처리를 Tasklet으로 구현해보자.
+
+휴면회원 배치처리를 Tasklet으로 전환
+/com/community/batch/jobs/inactive/InactiveItemTasklet.java
+import com.community.batch.domain.User;
+import com.community.batch.domain.enums.UserStatus;
+import com.community.batch.repository.UserRepository;
+
+import org.springframework.batch.core.StepContribution;
+import org.springframework.batch.core.scope.context.chunkContext;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.repeat.RepeatStatus;
+import org.springframework.stereotype.Component;
+
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.Date;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import lombok.AllArgsConstructor;
+
+@Component
+@AllArgsConstructor
+public class InactiveItemTasklet implements Tasklet {
+
+   private UserRepository userRepository;
+   
+   @Override
+   public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+      //reader
+      Date nowDate = (Date) chunkContext.getStepContext().getJobParameters().get("nowDate");
+      LocalDateTime now = LocalDateTime.ofInstant(nowDate.toInstant(), ZoneId.systemDefault());
+      List<User> inactiveUsers = userRepository.findByUpdatedDateBeforeAndStatusEquals(now.minusYears(1), UserStatus.ACTIVE);
+      
+      //processor
+      inactiveUsers = inactiveUsers.stream()
+                                   .map(User::setInactive)
+				   .collect(Collectros.toList());
+	
+      //writer
+      userRepository.saveAll(inactiveUsers);
+      
+      return RepeatStatus.FINISHED;
+   }
+}
+
+위 코드는 기존의 읽기 -> 처리 -> 쓰기로 진행되었던 청크 지향 프로세싱 방식의 구조를 하나로 합쳐놓은 것이다.
+
++배치의 인터셉터 Listener 설정하기
+배치 흐름에서 전후 처리를 하는 Listener를 설정할 수 있다.
+구체적으로 Job의 전후 처리, Step의 전후 처리, 각 청크 단위에서의 전후 처리 등 
+세세한 과정 실행 시 특정 로직을 할당해 제어할 수 있다.
+이해를 돕기 위해 Job의 실행 전후에 Job을 실행한다는 메시지와 실행이 종료됬다는 간단한 메시지 로그를 추가해보자.
+
+스프링 배치에서는 Job의 Listener로 JobExcecutionListener 인터페이스를 제공한다.
+이 인터페이스를 활용해서 다음과 같이 작성해보자.
+
+Job의 실행과 종료 메시지를 출력하는 InactiveJobListener 구현
+/com/community/batch/jobs/inactive/listener/InactiveJobListener.java
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.JobExecutionListener;
+import org.springframework.stereotype.Component;
+
+@Slf4j -> 필드에 로그 객체를 따로 생성할 필요없이 로그객체를 사용할 수 있도록 설정하는 롬복 어노테이션
+@Component -> 외부에서 InactiveJobListener를 주입받아서 사용할 수 있게 스프링 빈으로 등록
+public class InactiveJobListener implements JobExecutionListener { -> Job 실행 전후에 특정 로직을 담을 수 있도록 제공되는 인터페이스
+
+   @Override
+   public void beforeJob(JobExecution jobExecution) { -> Job 실행 전에 수행될 로직을 구현하는 메서드
+      log.info("Before Job");
+   }
+   
+   @Override
+   public void afterJob(JobExecution jobExecution) { -> Job 실행 후에 수행될 로직을 구현하는 메서드
+     log.info("After Job");
+   }
+}
+
+Job 설정에 Listener 등록하기
+/com/community/batch/jobs/inactive/InactiveUserJobConfig.java
+...
+import com.community.batch.jobs.inactive.listener.InactiveJobListner;
+
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+   ...
+   
+   //Job 정보 설정하는 메서드
+   @Bean
+   public Job inactiveUserJob(JobBuilderFactory jobBuilderFactory, InactiveJobListener inactiveJobListener, Step inactiveJobStep) {
+      return jobBuilderFactory.get("inactiveUserJob")
+                              .preventRestart()
+			      .listener(inactiveJobListener) -> 리스너 추가
+			      .start(inactiveJobStep)
+			      .build();
+   }
+   ...
+}
+
+배치 테스트 코드를 실행시켜 보면 Job 실행 전 후에 메시지가 출력되는 것을 확인할 수 있다.
+       
+JobExecutionListener 인터페이스 외에도 Listener로 제공되는 인터페이스는 다음과 같다.
+
+배치에서 제공되는 Listener 인터페이스와 어노테이션
+1. JobExecutionListener  @BeforeJob, @AfterJob                            Job 실행 전후 처리를 담당
+2. ChunkListener         @BeforeChunk, @AfterChunk, @AfterChunkError      Chunk 실행 전후 처리 및 에러 발생 시 처리를 담당
+3. ItemReadListener      @BeforeRead, @AfterRead, @OnReadError            Read 과정 전후 처리 및 에러 발생 시 처리를 담당
+4. ItemProcessListener   @BeforeProcess, @AfterProcess, @OnProcessError   Process 과정 전후 처리 및 에러 발생 시 처리를 담당
+5. ItemWriteListener     @BeforeWrite, @AfterWrite, @OnWriteError         Write 과정 전후 처리 및 에러 발생 시 처리를 담당
+6. StepExecutionListener @BeforeStep, @AfterStep                          Step 실행 전후 처리를 담당
+7. SkipListener          @OnSkipInRead, @OnSkipInWrite, @OnSkipInProcess  배치 처리 중 Skip이 발생했을 때를 담당
+  
++어노테이션 기반으로 Listener 설정하기
+이번에는 인터페이스 대신 어노테이션을 사용해 Listener 설정을 해보자.
+Step 실행 전후 처리 어노테이션인 @BeforeStep, @AfterStep을 사용해 Step 시작 전후에 로그 메시지를 출력해보자.
+
+어노테이션을 사용한 InactiveStepListener 생성
+/com/community/batch/jobs/inactive/listener/InactiveStepListener.java
+import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.annotation.AfterStep;
+import org.springframework.batch.core.annotation.BeforeStep;
+import org.springframework.stereotype.Component;
+
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@Component
+public class InactiveStepListener { -> StepExecutionListener 인터페이스를 구현하지 않고 @BeforeStep, @AfterStep 어노테이션을 사용해 동작하도록 만들었다.
+
+   @BeforeStep
+   public void beforeStep(StepExecution stepExecution) {
+      log.info("Before Step");
+   }
+   
+   @AfterStep
+   public void afterStep(StepExecution stepExecution) {
+      log.info("After Step");
+   }
+}
+
+다음은 InactiveStepListener를 Step의 Listener로 설정하는 코드이다.
+
+Step 설정에 Listener 등록하기
+...
+import com.community.batch.jobs.inactive.listener.InactiveStepListener;
+
+@AllArgsConstuctor
+@Configuration
+public class InactiveUserJobConfig {
+
+   ...
+   @Bean
+   public Step inactiveJobStep(StepBuilderFactory stepBuilderFactory) {
+      ListItemReader<User> inactiveUserReader, InactiveStepListener inactiveStepListener) {
+      return stepBuilderFactory.get("inactiveUserStep")
+          .<User, User> chunk(CHUNK_SIZE)
+	  .reader(inactiveUserReader)
+	  .processor(inactiveUserProcessor())	  
+	  .writer(inactiveUserWriter())
+	  .listener(inactiveStepListener)
+	  .build();
+   }
+   ...
+}
+
+inactiveJobStep 빈의 설정에서 listener(InactiveStepListener)를 추가해 InactiveStepListener 등록이 끝났다.
+
+배치 테스트를 실행시켜 정상적으로 Listener가 등록되었는지 확인해보자.
+
++Step의 흐름을 제어하는 Flow
+지금까지 Step 과정의 가장 기본은 '읽기-처리-쓰기'였다.
+하지만 더 세부적인 조건이 추가된다면 어떻게 해야 될까?
+특정 조건에 따라 Step의 실행 여부를 정할 수 있을까?
+
+이러한 상황에 대비해 스프링 배치에서는 흐름을 제어하는 Flow를 제공한다.
+그럼 랜덤하게 정수를 생성해 양수면 Step을 실행하고 음수면 아무런 행동도 취하지 않도록 Flow를 사용해 설정해보자.
+
+랜덤 정수값을 생성해서 양수면 inactiveJobStep()을 실행하고 아니면 아무런 행동도 취하지 않는다.
+
+조건을 확인하는 부분을 JobExecutionDecider 인터페이스를 사용해 구현할 수 있다.
+JobExecutionDecider 인터페이스는 decide() 메서드 하나만 제공한다.
+
+JobExecutionDecider 인터페이스
+spring-batch-core-4.0.1.RELEASE.jar/org/springframework/batch/core/job/flow/JobExecutionDecider.java
+public interface JobExecutionDecider {
+   FlowExecutionStatus decide(JobExecution jobExecution, StepExecution stepExecution);
+}
+
+decide() 메서드의 반환값으로 FlowExecutionStatus 객체를 반환하도록 명시되어 있다.
+FlowExecutionStatus 객체는 상태값 COMPLETED, STOPPED, FAILED, UNkNOWN 등을 제공한다.
+이 상태값으로 Step 실행 여부를 판별하도록 설정하자.
+
+InactiveJobExecutionDecider 구현하기
+/com/community/batch/jobs/inactive/InactiveJobExecutionDecider.java
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.job.flow.FlowExecutionStatus;
+import org.springframework.batch.core.job.flow.JobExecutionDecider;
+
+import java.util.Random;
+
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public class InactiveJobExecutionDecider implements JobExecutionDecider {
+
+   @Override
+   public FlowExecutionStatus decide(JobExecution jobExecution, StepExecution stepExecution) {
+       if(new Random().nextInt() > 0) { -> Random 객체를 사용해 랜덤한 정수값을 생성하고 양수인지 확인한다.
+          log.info("FlowExecutionStatus.COMPLETED");
+	  return FlowExecutionStatus.COMPLETED; -> 양수일 때 반환값
+       }
+       
+       log.info("FlowExecutionStatus.FAILED");
+       return FlowExecutionStatus.FAILED; -> 음수일 때 반환값
+   }
+}
+
+Flow의 조건으로 사용될 InactiveJobExecutionDecider 클래스를 구현했다.
+이제 이를 사용할 Flow를 구현해보자.
+inactiveUserJob() 메서드에서는 Step이 아닌 Flow를 주입받고, 주입받을 Flow를 inactiveJobFlow() 메서드를 통해 빈으로 등록한다.
+
+조건에 따라 Step의 실행 여부를 처리하는 inactiveJobFlow 설정하기
+/com/community/batch/inactive/InactiveUserJobConfig.java
+...
+import org.springframework.batch.core.job.flow.Flow;
+import org.springframework.batch.core.job.builder.FlowBuilder;
+import org.springframework.batch.core.job.flow.FlowExecutionStatus;
+
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+
+   ...
+   @Bean
+   public Job inactiveUserJob(JobBuilderFactory jobBuilderFactory, InactiveJobListener inactiveJobListener, Flow inactiveJobFlow) {
+       return jobBuilderFactory.get("inactiveUserJob")
+             .preventRestart()
+	     .listener(inactiveJobListener)
+	     .start(inactiveJobFlow) -> Job 시작 시 Flow를 거쳐 Step을 실행하도록 start()에 inactiveJobFlow를 설정한다.
+	     .end()
+	     .build();
+   }
+   
+   @Bean
+   public Flow inactiveJobFlow(Step inactiveJobStep) {
+      //FlowBuilder를 사용하면 Flow 생성을 한결 편하게 할 수 있다. 
+      //FlowBuilder의 생성자에 원하는 Flow 이름을 넣어서 생성한다.
+      FlowBuilder<Flow> flowBuilder = new FlowBuilder<>("inactiveJobFlow"); 
+      return flowBuilder
+         .start(new InactiveJobExecutionDecider()) -> 위에서 만든 조건처리 클래스를 사용한다.
+	 .on(FlowExecutionStatus.FAILED.getName()).end() -> FlowExecutionStatus.FAILED가 반환되면 end()를 사용해 곧바로 끝낸다.
+	 .on(FlowExecutionStatus.COMPLETED.getName()).to(inactiveJobStep) -> FlowExecutionStatus.COMPLETED가 반환되면 기존에 설정한 Step을 실행한다.
+	 .end();
+   }
+   ...
+}
+
+테스트를 실행해보자.
+
++멀티 스레드로 여러 개의 Step 실행하기
+보통은 배치 처리당 스레드 하나만 실행할 경우가 대부분이지만 상황에 따라 여러 Step을 동시에 실행하는 경우도 있다.
+스프링 부트 배치는 멀티 스레드로 Step을 실행하는 여러 전략을 제공한다.
+ 
+ 1. TaskExecutor를 사용해 여러 Step 동작시키기
+ 2. 여러 개의 Flow 실행시키기
+ 3. 파티셔닝을 사용한 병렬 프로그래밍
+ 
+ -TaskExecutor를 사용해 여러 Step 동작시키기
+ TaskExecutor 인터페이스는 멀티 스레드로 Step을 실행하는 가장 기본적인 방법이다.
+ Task(하나의 작업)는 Runnable 인터페이스를 구현해 각각의 스레드가 독립적으로 실행되도록 작업을 할당하는 객체이다.
+ 스프링에서는 이러한 Task를 실행하는 객체를 TaskExecutor 인터페이스를 통해 구현하도록 정의했다.
+ TaskExecutor 인터페이스를 구현한 객체가 여럿 있지만 여기서는 스레드를 요청할 때마다 스레드를 새로 생성하는
+ SimpleAsyncTaskExecutor 객체를 사용한다.
+ 
+ 다음은 휴면회원 배치 처리에 TaskExecutor를 등록해 멀티 스레드로 실행하도록 설정한 코드이다.
+ 
+ Step 설정에 TaskExecutor 등록하기
+ /com/community/batch/jobs/inactive/InactiveUserJobConfig.java
+ ...
+ import org.springframework.core.task.TaskExecutor;
+ import org.springframework.core.task.SimpleAsyncTaskExecutor;
+ 
+ @AllArgsConstructor
+ @Configuration
+ public class InactiveUserJobConfig {
+    ...
+    
+    @Bean
+    public Step inactiveJobStep(StepBuilderFactory stepBuilderFactory, ListItemReader<User> inactiveUserReader,
+                                  InactiveStepListener inactiveStepListener, TaskExecutor taskExecutor) {
+	  return stepBuilderFactory.get("inactiveUserStep")
+	       .<User, User> chunk(CHUNK_SIZE)
+	       .reader(inactiveUserReader)
+	       .processor(inactiveUserProcessor())
+	       .writer(inactiveUserWriter())
+	       .listener(inactiveStepListener)
+	       .taskExecutor(taskExecutor) -> 빈으로 생성한 TaskExecutor를 등록한다.
+	       //throttleLimit 설정은 '설정된 제한 횟수만큼만 스레드를 동시에 실행시키겠다'는 뜻이다.
+	       //따라서 시스템에 할당된 스레드 풀의 크기보다 작은 값으로 설정되어야 한다.
+	       //만약 1로 설정하면 기존의 동기화 방식과 동일한 방식으로 실행된다.
+	       //2로 설정하면 스레드를 2개씩 실행시킨다.
+	       .throttleLimit(2) 
+	       .build();
+    }
+     
+    ...
+    
+    @Bean
+    public TaskExecutor taskExecutor() {
+        //SimpleAsyncTaskExecutor를 생성해 빈으로 등록한다.
+	//생성자의 매개변수로 들어가는 값은 Task에 할당되는 이름이 된다.
+	//기본적으로 첫 번째 Task는 'Batch_Task1'이라는 이름으로 할당되면 뒤에 붙는 숫자가 
+	//하나씩 증가하며 이름이 정해진다.
+       return new SimpleAsyncTaskExecutor("Batch_Task");
+    }
+ }
+ 
+ 실행한 결과 로그를 살펴보면 여러 스레드가 병렬로 실행되어 로그 실행 순서가 뒤죽박죽으로 표시된다.
+ 스레드명이 'Batch_Task4'까지 표시되어 있으니 스레드가 총 4개 할당되었음을 확인할 수 있다.
+ 
++여러 개의 Flow 실행시키기
+Flow를 멀티 스레드로 실행시키는 방법을 알아보겠다.
+코드는 앞서 'Step의 흐름을 제어하는 Flow'에서 다룬 랜덤 정수값을 사용해
+Step을 실행하는 Flow 코드를 확장해서 작성한다.
+
+사실 앞서 설정한 Flow를 멀티 스레드로 동작시키는 방법은 그리 적절하지 않다.
+휴면회원으로 전환될 회원 데이터를 기간별로 나눠서 각각 스레드별로 처리하는 방법이 더 적절하다.
+지금은 사용 방법을 익히기 위해 기존에 구현한 코드에 멀티 스레드 방식을 적용할 것이다.
+어떤 식으로 스레드가 할당되어 Flow가 실행되는지에 초점을 맞춰 공부하기 바란다.
+
+기본적인 설정은 'TaskExecutor를 사용해 여러 Step 동작시키기'에서 진행한 방법과 같다.
+
+SimpleAsyncTaskExecutor 빈으로 등록
+/com/community/batch/jobs/inactive/InactiveUserJobConfig.java
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+    ...
+    
+    @Bean
+    public TaskExecutor taskExecutor() {
+       return new SimpleAsyncTaskExecutor("Batch_Task");
+    }
+ }
+ 
+ 여러 개의 Flow를 만들어 등록하고 사용해보자.
+ 
+ 멀티 Flow 설정하기
+ /com/community/batch/jobs/inactive/InactiveUserJobConfig.java
+ ...
+ import java.util.stream.IntStream;
+ 
+ @AllArgsConstructor
+ @Configuration
+ public class InactiveUserJobConfig {
+     ...
+     @Bean
+     public Job inactiveUserJob(JobBuilderFactory jobBuilderFactory, InactiveJobListener inactiveJobListener,
+                               ->  Flow multiFlow) {
+           return jobBuilderFactory.get("inactiveUserJob")
+	       .preventRestart()
+	       .listener(inactiveJobListener)
+	       .start(multiFlow)  <- 빈으로 등록한 multiFlow 설정으로 시작한다.
+	       .end()
+	       .build();
+     }
+     
+     @Bean
+     public Flow multiFlow(Step inactiveJobStep) {
+        Flow flows[] = new Flow[5];
+	//IntStream을 이용해 flows 배열의 크기(5개)만큼 반복문을 돌린다.
+	//FlowBuilder 객체로 Flow(inactiveJobFlow) 5개를 생성해서 flows 배열에 할당한다.
+	//from() 메서드로 Flow 생성을 메서드에 할당한다.
+	IntStream.range(0, flows.length).forEach(i -> flows[i] =
+	        new FlowBuilder<Flow>("MultiFlow" + i).from(inactiveJobFlow(inactiveJobStep)).end();
+        FlowBuilder<Flow> flowBuilder = new FlowBuilder<>("MultiFlowTest");
+	return flowBuilder
+	   .split(taskExecutor()) -> multiFlow에서 사용할 TaskExecutor를 등록한다.
+	   .add(flows) -> inactiveJobFlow 5개가 할당된 flows 배열을 추가한다.
+	   .build();
+     }
+     
+     //@Bean
+     //기존의 inactiveJobFlow는 빈으로 등록되어 있다.
+     //빈은 기본적으로 싱글턴으로 등록되기 때문에 여러 inactiveJobFlow를 각각 생성하려면 @Bean 어노테이션을 제거하여 
+     //빈이 아닌 일반 객체를 생성해 반환 하도록 설정해야 한다.
+     private Flow inactiveJobFlow(Step inactiveJobStep) {
+          FlowBuilder<Flow> flowBuilder = new FlowBuilder<>("inactiveJobFlow");
+	  return flowBuilder
+	     .start(new InactiveJobExecutionDecider())
+	     .on(FlowExecutionStatus.FAILED.getName()).end()
+	     .on(FlowExecutionStatus.COMPLETED.getName()).to(inactiveJobStep)
+	     .end();
+     }
+     ...
+ }
+ 
+ 테스트를 실행하면 'Batch_Task5'까지 표기가 되었고 스레드가 5개 할당되었다.
+ 
++파티셔닝을 사용한 병렬 프로그래밍
+여기서는 Step 여러 개를 병렬로 실행시키는 파티셔닝에 대해 알아본다.
+
+소스코드
+https://github.com/young891221/Spring-Boot-Community-Batch/tree/step3
+
+파티셔닝의 원리는 간단하다.
+파티셔너로 구분된 각 Step에 스레드를 할당해 병렬적으로 실행시키는 방법이다.
+
+Job안에 Step들이 있고 Step과 Step사이에 마스터라는게 있는데 이 마스터는
+여러 개의 슬레이브로 나뉜다.
+
+일련의 Step 절차 중 마스터가 있는데, 여기서 마스터를 여러 슬레이브로 나눈다.
+슬레이브는 일반적으로 실행되는 스레드라고 생각할 수 있다.
+슬레이브와 마스터는 모두 Step의 인스턴스이다.
+모든 슬레이브의 작업이 완료되면 결과가 합쳐져서 마스터가 완료되고 Step이 마무리된다.
+
+휴면회원으로 전환할 회원을 각 등급에 따라 병렬로 처리하게끔 파티셔닝을 구현해보자.
+스프링 배치에서는 파티셔닝을 어떤 전략으로 생성할지 결정하는 Patitioner 전략 인터페이스를 제공한다.
+Partitioner 인터페이스는 다음과 같다.
+
+Partitioner 인터페이스
+spring-batch-core-4.0.1.RELEASE.jar/org/springframework/batch/core/partition/support/Partitioner.java
+public interface Partitioner {
+   Map<String, ExecutionContext> partition(int gridSize);
+}
+
+Partitioner 인터페이스는 partition() 메서드만 제공한다.
+partition() 메서드는 Step의 최대 분할 수를 지정하는 파라미터 gridSize를 갖는다.
+키는 스레드명, 값은 ExecutionContext를 갖는 Map 타입을 반환한다.
+
+이미 스프링 부트 배치에서는 Partitioner 인터페이스를 구현한 SimplePartitioner와 MultiResourcePartitioner를 제공한다.
+이미 구현된 클래스를 사용해도 상관없지만 Partitioner 인터페이스를 직접 구현하여 등급에 따라 Step을 할당하도록 만들어보자.
+다음은 회원 등급에 따라 파티션을 분할하는 코드이다.
+
+회원등급에 따라 파티션을 분할하는 InactiveUserPartitioner
+/com/community/batch/jobs/inactive/InactiveUserPartitioner.java
+import com.community.batch.domain.enums.Grade;
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.item.ExecutionContext;
+import java.util.HashMap;
+import java.util.Map;
+
+public class InactiveUserPartitioner implements Partitioner {
+   
+   private static final String GRADE = "grade";
+   private static final String INACTIVE_USER_TASK = "InactiveUserTask";
+   
+   @Override
+   public Map<String, ExecutionContext> partition(int gridSize) {
+     //gridSize만큼 Map 크기를 할당한다.
+     Map<String, ExecutionContext> map = new HashMap<>(gridSize);
+     //Grade Enum에 정의된 모든 값을 grades 배열 변수로 할당한다.
+     Grade[] grades = Grade.values();
+     //grades 값만큼 파티션을 생성하는 루프문을 돌린다.
+     for (int i = 0, length = grades.length; i < length; i++) {
+        ExecutionContext context = new ExecutionContext();
+	//Step에서 파라미터로 Grade 값을 받아 사용한다.
+	//이 때 ExecutionContext 키값은 'grade'이다.
+	//Grade Enum의 이름값을 context에 추가한다.
+	context.putString(GRADE, grades[i].name());
+	//반환되는 map에 'InactiveUserTask1..2..3' 형식의 파티션 키값을 지정하고
+	//위 코드에서 추가한 ExecutionContext를 map에 추가한다.
+	map.put(INACTIVE_USER_TASK + i, context);
+      }
+      return map;
+   }
+}
+
+사용자의 등급에 따라 파티셔닝 전략을 InactiveUserPartitioner로 구현했다.
+이제 Job 설정에 파티셔닝 전략을 추가한다.
+기존의 Job 설정에서 변경된 부분만 살펴보자.
+
+Job 설정에 파티셔닝 전략추가
+/com/community/batch/jobs/inactive/InactiveUserJobConfig.java
+...
+import org.springframework.batch.core.configuration.annotation.JobScope;
+import com.community.batch.domain.enums.Grade;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@AllArgsConstructor
+@Configuration
+public class InactiveUserJobConfig {
+
+  @Bean
+  public Job inactiveUserJob(JobBuilderFactory jobBuilderFactory, InactiveJobListener, Step partitionerStep) {
+     return jobBuilderFactory.get("inactiveUserJob")
+        .preventRestart();
+	.listener(inactiveJobListener)
+	.start(partitionerStep)  <-
+	.build();
+  }
+  
+  @Bean
+  //Job 실행 때마다 빈을 새로 생성하는 @JobScope를 추가했다.
+  @JobScope
+  public Step partitionerStep(StepBuilderFactory stepBuilderFactory, Step inactiveJobStep) {
+     return stepBuilderFactory
+        .get("partitionerStep")
+	//파티셔닝을 사용하는 partitioner 프로퍼티에 Step 이름과 위에서 작성한 InactiveUserPartitioner 객체를 생성해 등록한다.
+	.partitioner("partitionerStep", new InactiveUserPartitioner())
+	//InactiveUserPartitioner 코드에서 파라미터로 사용한 gridSize를 등록한다.
+	//현재 Grade Enum 값이 3이므로 3이상으로 등록한다.
+	.gridSize(5)
+	.step(inactiveJobStep)
+	.taskExecutor(taskExecutor())
+	.build();
+  }
+  
+  ...
+  
+  @Bean
+  @StepScope
+  //SpEL을 사용하여 ExecutionContext에 할당한 등급값을 불러온다.
+  public ListItemReader<User> inactiveUserReader(@Value("#{stepExecutionContext[grade]}" String grade, UserRepository userRepository) {
+      log.info(Thread.currentThread().getName());
+      List<User> inactiveUsers = userRepository.
+             findBydUpdateDateBeforeAndStatusEqualsAndGradeEquals(
+	     LocalDateTime.now().minusYears(1), UserStatus.ACTIVE,
+	     //휴면회원을 불러오는 쿼리에 등급을 추가해 해당 등급의 휴면회원만 불러오도록 설정한다.
+	     Grade.valueOf(grade));
+      return new ListItemReader<>(inactiveUsers);
+  }
+  ...
+}
+
+휴면회원 배치 테스트를 실행시켜보자.
+현재 스레드의 이름을 로그로 찍어 어떤 스레드가 할당되었는지 파악할 수 있게 했다.
+Grade 수가 3이므로 파티션이 3개 할당되어야 한다.
+Batch_Task1, Batch_Task2, Batch_Task3이 보이면 정상이다.
+
++마치며
+스프링 부트 배치의 입문부터 멀티 스레드 처리까지 살펴보았다.
+배치 처리는 서비스 백엔드에서 특정 데이터를 읽어와 처리한 후 저장하는 구조이다.
+이런 구조를 이해하면 Job, Step등의 배치에서 제공하는 개념을 바탕으로 원하는 배치 처리를 생성할 수 있다.
+
+멀티 스레드로 Step을 실행하는 부분이 어려울 수 있다.
+큰 데이터에 유용하므로 꼭 예제를 직접 코딩하여 실행해보자.
+ 
